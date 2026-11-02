@@ -1,0 +1,31 @@
+# Local application state, credentials and caches
+/.agents/
+/.aws/
+/.codex/
+/.cache/
+**/.git/
+__pycache__/
+*.py[cod]
+*.log
+*.part
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.env
+.env.*
+!.env.example
+
+# Downloaded model weights, datasets and generated evaluation output
+/DCPO/models/
+/DCPO/data/
+/RLCR/models/
+/RLCR/data/*
+!/RLCR/data/creation_scripts/
+/RLCR/eval_outputs/
+**/checkpoints/
+**/wandb/
+
+# Local environments
+/.conda/
+/.venv/
+/venv/
