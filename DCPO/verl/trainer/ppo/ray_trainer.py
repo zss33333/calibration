@@ -723,7 +723,19 @@ class RayPPOTrainer(object):
 
         for test_data in self.val_dataloader:
             test_batch = DataProto.from_single_dict(test_data)
+            # 适用于当前具有稳定 extra_info["index"] 的 AIME24 验证数据。
 
+            
+            sources = test_batch.non_tensor_batch["data_source"]
+            extra_infos = test_batch.non_tensor_batch["extra_info"]
+
+            test_batch.non_tensor_batch["uid"] = np.array(
+                [
+                    f"val:{source}:{info['index']}"
+                    for source, info in zip(sources, extra_infos)
+                ],
+                dtype=object,
+            )
             # repeat test batch
             test_batch = test_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.val_kwargs.n,
                                            interleave=True)

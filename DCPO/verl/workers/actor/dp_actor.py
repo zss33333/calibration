@@ -575,6 +575,7 @@ class DataParallelPPOActor(BasePPOActor):
                         clip_ratio_c=clip_ratio_c,
                         algorithm_name=self.config.algorithm_name,
                         beta=self.config.beta,
+                        loss_agg_mode=loss_agg_mode, 
                     )
                     # compute entropy loss from entropy
                     entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)

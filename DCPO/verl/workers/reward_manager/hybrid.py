@@ -173,37 +173,58 @@ class HybridRewardManager:
         confidence_tensor = torch.tensor(confidence_score_list)
         pos = confidence_pos_list
 
-        # calibration: mean accuracy - individual confidence
-        num_rollouts = 8
+        # # calibration: mean accuracy - individual confidence
+        # num_rollouts = 8
 
-        if num_rollouts is None:
-            # fallback：从 batch size 和 prompt 数推断
-            # 官方 GRPO 通常 batch_size = num_prompts * num_rollouts
-            raise ValueError("num_rollouts must be provided for GRPO")
+        # if num_rollouts is None:
+        #     # fallback：从 batch size 和 prompt 数推断
+        #     # 官方 GRPO 通常 batch_size = num_prompts * num_rollouts
+        #     raise ValueError("num_rollouts must be provided for GRPO")
 
-        batch_size = len(accuracy_score_list)
-        if batch_size % num_rollouts != 0:
-            num_rollouts = 1  # cannot group, treat each separately
+        # batch_size = len(accuracy_score_list)
+        # if batch_size % num_rollouts != 0:
+        #     num_rollouts = 1  # cannot group, treat each separately
 
-        num_groups = batch_size // num_rollouts
+        # num_groups = batch_size // num_rollouts
 
-        # (num_groups, num_rollouts)
-        accuracy_grouped = accuracy_tensor.view(num_groups, num_rollouts)
+        # # (num_groups, num_rollouts)
+        # accuracy_grouped = accuracy_tensor.view(num_groups, num_rollouts)
 
-        # group mean accuracy: (num_groups,)
-        group_mean_accuracy = accuracy_grouped.mean(dim=1)
+        # # group mean accuracy: (num_groups,)
+        # group_mean_accuracy = accuracy_grouped.mean(dim=1)
 
-        # broadcast back to rollout level: (batch_size,)
-        group_mean_accuracy_expanded = group_mean_accuracy.repeat_interleave(num_rollouts)
+        # # broadcast back to rollout level: (batch_size,)
+        # group_mean_accuracy_expanded = group_mean_accuracy.repeat_interleave(num_rollouts)
+
+        # 每个回答所属的采样组。训练时，同一次题目采样的回答共享 uid。
+        uids = data.non_tensor_batch.get("uid")
+        if uids is None:
+            raise ValueError(
+                "HybridRewardManager requires a uid for every response."
+            )
+
+        if len(uids) != len(accuracy_score_list):
+            raise ValueError("uid count does not match response count.")
+
+        # 收集每个组在当前 batch 中的位置，不依赖回答是否连续。
+        group_rows = defaultdict(list)
+        for i, uid in enumerate(uids):
+            group_rows[uid].append(i)
+
+        # 将同题组正确率回填到每个回答所在的位置。
+        group_mean_accuracy_expanded = torch.empty_like(accuracy_tensor)
+
+        for rows in group_rows.values():
+            group_mean_accuracy_expanded[rows] = accuracy_tensor[rows].mean()
+
 
         gamma = 0.5
 
         hybrid_accuracy_tensor = gamma * accuracy_tensor + (1 - gamma) * group_mean_accuracy_expanded
 
-        calibration_scores = torch.square(
-           hybrid_accuracy_tensor - confidence_tensor
-        )
-
+        calibration_scores = torch.abs(
+                hybrid_accuracy_tensor - confidence_tensor
+            )
         weight = 0.5
 
         for i in range(len(data)):
