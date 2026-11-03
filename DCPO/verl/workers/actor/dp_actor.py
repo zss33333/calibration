@@ -165,12 +165,60 @@ class DataParallelPPOActor(BasePPOActor):
         else:
             grad_norm = torch.nn.utils.clip_grad_norm_(self.actor_module.parameters(), max_norm=self.config.grad_clip)
 
+        # Opt-in verification samples local FSDP parameter shards, not full weights.
+        verify_update = bool(self.config.get('verify_parameter_update', False))
+        samples = []
+        if verify_update:
+            with torch.no_grad():
+                for param in self.actor_module.parameters():
+                    if not param.requires_grad or param.grad is None or param.numel() == 0:
+                        continue
+                    count = min(4096, param.numel())
+                    stride = max(1, param.numel() // count)
+                    indices = torch.arange(count, device=param.device) * stride
+                    before = param.detach().reshape(-1)[indices].float().cpu()
+                    gradient = param.grad.detach().reshape(-1)[indices].float().cpu()
+                    samples.append((param, indices, before, gradient))
+
         # if grad_norm is not finite, skip the update
-        if not torch.isfinite(grad_norm):
+        skipped = not bool(torch.isfinite(grad_norm).item())
+        if skipped:
             print(f"WARN: grad_norm is not finite: {grad_norm}")
             self.actor_optimizer.zero_grad()
         else:
             self.actor_optimizer.step()
+
+        if verify_update:
+            changed = nonzero_grad = changed_with_grad = sampled = 0
+            max_delta = 0.0
+            samples_finite = True
+            with torch.no_grad():
+                for param, indices, before, gradient in samples:
+                    after = param.detach().reshape(-1)[indices].float().cpu()
+                    delta = (after - before).abs()
+                    differs = after != before
+                    has_gradient = gradient != 0
+                    sampled += before.numel()
+                    changed += int(differs.sum().item())
+                    nonzero_grad += int(has_gradient.sum().item())
+                    changed_with_grad += int((differs & has_gradient).sum().item())
+                    samples_finite &= bool(torch.isfinite(before).all().item()
+                                           and torch.isfinite(after).all().item()
+                                           and torch.isfinite(gradient).all().item())
+                    if torch.isfinite(delta).all():
+                        max_delta = max(max_delta, delta.max().item())
+                    else:
+                        max_delta = float('nan')
+            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+            lr = self.actor_optimizer.param_groups[0]['lr']
+            print(
+                f"[UPDATE_CHECK rank={rank}] lr={float(lr):.9e} "
+                f"grad_norm={grad_norm.item():.9e} skipped={int(skipped)} "
+                f"sampled={sampled} grad_nonzero={nonzero_grad} "
+                f"changed={changed} changed_with_grad={changed_with_grad} "
+                f"max_delta={max_delta:.9e} finite={int(samples_finite)}",
+                flush=True,
+            )
         return grad_norm
 
     def compute_log_prob(self, data: DataProto) -> torch.Tensor:
