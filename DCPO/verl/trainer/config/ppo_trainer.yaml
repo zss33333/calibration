@@ -214,6 +214,7 @@ custom_reward_function:
   name: compute_score
 
 algorithm:
+  norm_adv_by_std: True
   gamma: 1.0
   lam: 1.0
   adv_estimator: gae

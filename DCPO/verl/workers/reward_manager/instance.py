@@ -176,8 +176,9 @@ class InstanceRewardManager:
         calibration_scores = torch.square(
             accuracy_tensor - confidence_tensor
         )
-
-        weight = 0.3
+        # dcpo
+        # weight = 0.3
+        weight = 1
 
         for i in range(len(data)):
         # get the position used previously

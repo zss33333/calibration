@@ -118,7 +118,7 @@ def model_generate(session, model_name, model_url, prompt, max_tokens, gen_type 
 
 def get_confidence_and_answer(session, model_name, model_url, prompt, max_tokens, gen_type = 'verbal'):
     directive = (
-        "\n\nPlease put your final answer within \boxed{}.\n"
+        "\n\nPlease put your final answer within \\boxed{}.\n"
         "\nAlso output a singal line at the end of the answer：CONFIDENCE: <float number between 0 and 1>\n"
         "e.g. ：CONFIDENCE: 0.83\n"
         "Please make sure CONFIDENCE part is in a singal line with the exact same format。\n"
