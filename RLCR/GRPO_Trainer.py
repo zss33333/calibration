@@ -58,7 +58,6 @@ from trl.trainer.utils import (
     pad,
     selective_log_softmax,
 )
-from reward_fns import conflict_reward_components
 from trainer_utils import nanstd, RepeatSampler, nanmin, nanmax, shuffle_tensor_dict,split_tensor_dict, disable_dropout_in_model,profiling_decorator,profiling_context
 import gc
 
@@ -713,69 +712,26 @@ class CustomTrainer(Trainer):
             if any(example.get("source") != "hotpot" for example in inputs):
                 raise ValueError("The conflict diagnostic expects HotpotQA inputs.")
 
-            # rl_runner.py supplies accuracy_reward as a partial with
-            # format_pattern already bound. Reuse that exact pattern.
+            # rewards_per_func 已由训练所用的原始奖励函数计算并 gather。
+            # accuracy_reward 对格式无效的回答给 C=0。
             accuracy_index = self.reward_func_names.index("accuracy_reward")
-            accuracy_func = self.reward_funcs[accuracy_index]
-            format_pattern = accuracy_func.keywords["format_pattern"]
+            c_all = rewards_per_func[:, accuracy_index]
 
-            c_values, q_values = conflict_reward_components(
-                format_pattern=format_pattern,
-                completions=completions,
-                answer=[example["answer"] for example in inputs],
-                source=[example["source"] for example in inputs],
-            )
+            # 实际加权奖励若非有限值，原训练也无法得到有效梯度；
+            # 此处报错，不用填充值改变它。
+            if not torch.isfinite(rewards).all():
+                raise ValueError("Actual weighted RLCR rewards contain NaN or Inf.")
+            if not torch.isfinite(c_all).all():
+                raise ValueError("Accuracy rewards contain NaN or Inf.")
 
-            c_local = torch.tensor(c_values, dtype=torch.float32, device=device)
-            q_local = torch.tensor(
-                [float("nan") if q is None else q for q in q_values],
-                dtype=torch.float32,
-                device=device,
-            )
-
-            # Use the same gather and rank ordering as the existing
-            # rewards/advantages path.
-            c_all = gather(c_local)
-            q_all = gather(q_local)
-
-            if not torch.equal(
-                c_all, rewards_per_func[:, accuracy_index]
-            ):
-                raise ValueError("Diagnostic C differs from accuracy_reward.")
-
-            if c_all.numel() % self.num_generations != 0:
-                raise ValueError("Incomplete generation group.")
-
-            group_valid = torch.isfinite(q_all).view(
-                -1, self.num_generations
-            ).all(dim=1)
-            row_valid = group_valid.repeat_interleave(self.num_generations)
-
-            # Invalid groups are marked for exclusion in the later loss step.
-            # Their placeholder Q must never contribute to a gradient.
-            q_safe = torch.nan_to_num(q_all, nan=0.0)
-            reward_acc = c_all
-            reward_rlcr = c_all - (q_safe - c_all).square()
-
-            def group_center(reward):
-                grouped = reward.view(-1, self.num_generations)
-                centered = grouped - grouped.mean(dim=1, keepdim=True)
-                return centered.reshape(-1)
+            grouped_c = c_all.view(-1, self.num_generations)
+            acc_adv_all = (
+                grouped_c - grouped_c.mean(dim=1, keepdim=True)
+            ).reshape(-1)
 
             diagnostic_tensors = {
-                "diagnostic_adv_acc": group_center(reward_acc)[process_slice],
-                "diagnostic_adv_rlcr": group_center(reward_rlcr)[process_slice],
-                "diagnostic_valid": row_valid[process_slice],
-                "diagnostic_c": c_all[process_slice],
-                "diagnostic_q": q_all[process_slice],
+                "diagnostic_adv_acc": acc_adv_all[process_slice],
             }
-
-            self._metrics[mode]["diagnostic/valid_group_rate"].append(
-                group_valid.float().mean().item()
-            )
-            self._metrics[mode]["diagnostic/valid_q_rate"].append(
-                torch.isfinite(q_all).float().mean().item()
-            )
 
 
 
@@ -832,8 +788,6 @@ class CustomTrainer(Trainer):
         """Build paired BNPO losses without changing the training loss."""
         required = (
             "diagnostic_adv_acc",
-            "diagnostic_adv_rlcr",
-            "diagnostic_valid",
         )
         if any(key not in inputs for key in required):
             raise ValueError("Paired diagnostic tensors are missing.")
@@ -878,27 +832,20 @@ class CustomTrainer(Trainer):
             1 + self.epsilon_high,
         )
 
-        # Exclude every trajectory belonging to an invalid Q group.
-        # Both rewards use this identical mask and BNPO denominator.
-        valid_mask = completion_mask * (
-            inputs["diagnostic_valid"]
-            .unsqueeze(1)
-            .to(completion_mask.dtype)
-        )
-        denominator = valid_mask.sum().clamp(min=1.0)
+        # Match the original BNPO token normalization without excluding completions.
+        denominator = completion_mask.sum().clamp(min=1.0)
 
+        
         def bnpo_loss(advantages):
             per_token_loss1 = ratio * advantages.unsqueeze(1)
             per_token_loss2 = clipped_ratio * advantages.unsqueeze(1)
-            per_token_loss = -torch.min(
-                per_token_loss1, per_token_loss2
-            )
-            return (per_token_loss * valid_mask).sum() / denominator
+            per_token_loss = -torch.min(per_token_loss1, per_token_loss2)
+            return (per_token_loss * completion_mask).sum() / denominator
 
         loss_acc = bnpo_loss(inputs["diagnostic_adv_acc"])
-        loss_rlcr = bnpo_loss(inputs["diagnostic_adv_rlcr"])
+        loss_rlcr = bnpo_loss(inputs["advantages"])
 
-        return loss_acc, loss_rlcr, valid_mask.sum()
+        return loss_acc, loss_rlcr, completion_mask.sum()
 
     @profiling_decorator
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
