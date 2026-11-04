@@ -58,7 +58,7 @@ from trl.trainer.utils import (
     pad,
     selective_log_softmax,
 )
-
+from reward_fns import conflict_reward_components
 from trainer_utils import nanstd, RepeatSampler, nanmin, nanmax, shuffle_tensor_dict,split_tensor_dict, disable_dropout_in_model,profiling_decorator,profiling_context
 import gc
 
@@ -285,6 +285,9 @@ class CustomTrainer(Trainer):
         self.vllm_tensor_parallel_size = args.vllm_tensor_parallel_size
         self.loss_type = args.loss_type
         self.scale_rewards = args.scale_rewards
+        # 新增梯度诊断参数
+        self.conflict_diagnostic = args.conflict_diagnostic
+        
         self.mask_truncated_completions = args.mask_truncated_completions 
         self.vllm_sleeping = False 
 
@@ -694,6 +697,88 @@ class CustomTrainer(Trainer):
         )
         advantages = advantages[process_slice]
 
+        diagnostic_tensors = {}
+
+        if self.conflict_diagnostic and mode == "train":
+            if self.loss_type != "bnpo" or self.scale_rewards or self.beta != 0.0:
+                raise ValueError(
+                    "The conflict diagnostic requires bnpo, "
+                    "scale_rewards=False, and beta=0."
+                )
+            if self.num_iterations != 1 or self.args.delta is not None:
+                raise ValueError(
+                    "The conflict diagnostic requires num_iterations=1 "
+                    "and delta=None."
+                )
+            if any(example.get("source") != "hotpot" for example in inputs):
+                raise ValueError("The conflict diagnostic expects HotpotQA inputs.")
+
+            # rl_runner.py supplies accuracy_reward as a partial with
+            # format_pattern already bound. Reuse that exact pattern.
+            accuracy_index = self.reward_func_names.index("accuracy_reward")
+            accuracy_func = self.reward_funcs[accuracy_index]
+            format_pattern = accuracy_func.keywords["format_pattern"]
+
+            c_values, q_values = conflict_reward_components(
+                format_pattern=format_pattern,
+                completions=completions,
+                answer=[example["answer"] for example in inputs],
+                source=[example["source"] for example in inputs],
+            )
+
+            c_local = torch.tensor(c_values, dtype=torch.float32, device=device)
+            q_local = torch.tensor(
+                [float("nan") if q is None else q for q in q_values],
+                dtype=torch.float32,
+                device=device,
+            )
+
+            # Use the same gather and rank ordering as the existing
+            # rewards/advantages path.
+            c_all = gather(c_local)
+            q_all = gather(q_local)
+
+            if not torch.equal(
+                c_all, rewards_per_func[:, accuracy_index]
+            ):
+                raise ValueError("Diagnostic C differs from accuracy_reward.")
+
+            if c_all.numel() % self.num_generations != 0:
+                raise ValueError("Incomplete generation group.")
+
+            group_valid = torch.isfinite(q_all).view(
+                -1, self.num_generations
+            ).all(dim=1)
+            row_valid = group_valid.repeat_interleave(self.num_generations)
+
+            # Invalid groups are marked for exclusion in the later loss step.
+            # Their placeholder Q must never contribute to a gradient.
+            q_safe = torch.nan_to_num(q_all, nan=0.0)
+            reward_acc = c_all
+            reward_rlcr = c_all - (q_safe - c_all).square()
+
+            def group_center(reward):
+                grouped = reward.view(-1, self.num_generations)
+                centered = grouped - grouped.mean(dim=1, keepdim=True)
+                return centered.reshape(-1)
+
+            diagnostic_tensors = {
+                "diagnostic_adv_acc": group_center(reward_acc)[process_slice],
+                "diagnostic_adv_rlcr": group_center(reward_rlcr)[process_slice],
+                "diagnostic_valid": row_valid[process_slice],
+                "diagnostic_c": c_all[process_slice],
+                "diagnostic_q": q_all[process_slice],
+            }
+
+            self._metrics[mode]["diagnostic/valid_group_rate"].append(
+                group_valid.float().mean().item()
+            )
+            self._metrics[mode]["diagnostic/valid_q_rate"].append(
+                torch.isfinite(q_all).float().mean().item()
+            )
+
+
+
         # Log the metrics
         if mode == "train":
             self.state.num_input_tokens_seen += self.accelerator.gather_for_metrics(attention_mask.sum()).sum().item()
@@ -738,7 +823,82 @@ class CustomTrainer(Trainer):
             "completion_mask": completion_mask,
             "advantages": advantages,
             "old_per_token_logps": old_per_token_logps,
+            **diagnostic_tensors,
         }
+
+    
+
+    def compute_conflict_losses(self, model, inputs):
+        """Build paired BNPO losses without changing the training loss."""
+        required = (
+            "diagnostic_adv_acc",
+            "diagnostic_adv_rlcr",
+            "diagnostic_valid",
+        )
+        if any(key not in inputs for key in required):
+            raise ValueError("Paired diagnostic tensors are missing.")
+
+        if self.loss_type != "bnpo" or self.beta != 0.0:
+            raise ValueError("Conflict diagnosis requires BNPO and beta=0.")
+        if self.args.delta is not None:
+            raise ValueError("Conflict diagnosis requires delta=None.")
+        if inputs["old_per_token_logps"] is not None:
+            raise ValueError(
+                "Expected old_per_token_logps=None so both probability "
+                "ratios equal 1 and PPO clipping is inactive."
+            )
+
+        prompt_ids = inputs["prompt_ids"]
+        prompt_mask = inputs["prompt_mask"]
+        completion_ids = inputs["completion_ids"]
+        completion_mask = inputs["completion_mask"]
+
+        # Match the trimming and log-probability path in _compute_loss.
+        max_dim = completion_mask.sum(1).max()
+        completion_ids = completion_ids[:, :max_dim]
+        completion_mask = completion_mask[:, :max_dim]
+
+        input_ids = torch.cat([prompt_ids, completion_ids], dim=1)
+        attention_mask = torch.cat(
+            [prompt_mask, completion_mask], dim=1
+        )
+        per_token_logps = self._get_per_token_logps(
+            model,
+            input_ids,
+            attention_mask,
+            completion_ids.size(1),
+        )
+
+        # This is the same old-log-probability fallback as _compute_loss.
+        old_per_token_logps = per_token_logps.detach()
+        ratio = torch.exp(per_token_logps - old_per_token_logps)
+        clipped_ratio = torch.clamp(
+            ratio,
+            1 - self.epsilon_low,
+            1 + self.epsilon_high,
+        )
+
+        # Exclude every trajectory belonging to an invalid Q group.
+        # Both rewards use this identical mask and BNPO denominator.
+        valid_mask = completion_mask * (
+            inputs["diagnostic_valid"]
+            .unsqueeze(1)
+            .to(completion_mask.dtype)
+        )
+        denominator = valid_mask.sum().clamp(min=1.0)
+
+        def bnpo_loss(advantages):
+            per_token_loss1 = ratio * advantages.unsqueeze(1)
+            per_token_loss2 = clipped_ratio * advantages.unsqueeze(1)
+            per_token_loss = -torch.min(
+                per_token_loss1, per_token_loss2
+            )
+            return (per_token_loss * valid_mask).sum() / denominator
+
+        loss_acc = bnpo_loss(inputs["diagnostic_adv_acc"])
+        loss_rlcr = bnpo_loss(inputs["diagnostic_adv_rlcr"])
+
+        return loss_acc, loss_rlcr, valid_mask.sum()
 
     @profiling_decorator
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):

@@ -4,6 +4,15 @@ from math_verify import verify,parse
 import numpy as np 
 import string
 
+
+#梯度诊断
+
+
+
+
+
+
+
 def normalize_answer(s):
 
     def remove_articles(text):
@@ -84,6 +93,47 @@ def accuracy_reward(format_pattern,completions,answer,source=None,**kwargs):
                 label = verify(e,attempt)
             matches.append(float(label))
     return matches
+# 梯度冲突分析
+def conflict_reward_components(format_pattern, completions, answer, source=None):
+    """Return C and Q for the paired BNPO gradient diagnostic.
+
+    Q is None when the last confidence tag is missing, non-numeric,
+    non-finite, or outside [0, 1].
+    """
+    correctness = accuracy_reward(
+        format_pattern=format_pattern,
+        completions=completions,
+        answer=answer,
+        source=source,
+    )
+
+    confidences = []
+    confidence_pattern = r"<confidence>(.*?)</confidence>"
+
+    for completion in completions:
+        content = completion[0]["content"]
+        matches = re.findall(
+            confidence_pattern, content, re.DOTALL | re.MULTILINE
+        )
+        raw_confidence = matches[-1] if matches else None
+
+        if raw_confidence is None:
+            confidences.append(None)
+            continue
+
+        try:
+            confidence = float(raw_confidence)
+        except ValueError:
+            confidences.append(None)
+            continue
+
+        if not math.isfinite(confidence) or not 0.0 <= confidence <= 1.0:
+            confidences.append(None)
+        else:
+            confidences.append(confidence)
+
+    return correctness, confidences
+
 
 def brier_reward(format_pattern,completions,answer,source=None, **kwargs):
     """Reward function that checks if the completion is correct."""

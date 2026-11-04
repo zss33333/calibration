@@ -266,6 +266,11 @@ class GRPOConfig(trl.GRPOConfig):
             "deviation introduces a question-level difficulty bias."
         },
     )
+    
+    conflict_diagnostic: bool = field(
+        default=False,
+        metadata={"help": "Prepare paired accuracy/RLCR advantages for BNPO diagnosis."},
+    )
 
     shuffle_dataset: Optional[bool] = field(
         default=True,
