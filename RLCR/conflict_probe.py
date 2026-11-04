@@ -27,19 +27,34 @@ def accumulated_projection(trainer, microbatches):
     if trainer.accelerator.num_processes != 1:
         raise ValueError("This probe requires one training process.")
 
+    # Reject the whole window before any forward or gradient calculation.
+    # A zero-token microbatch makes the original loss's log-probability
+    # trimming path invalid; dropping it would change the update window.
+    token_counts = [
+        int(inputs["completion_mask"].sum().item())
+        for inputs in microbatches
+    ]
+    for index, count in enumerate(token_counts):
+        if count == 0:
+            return {
+                "status": "invalid_zero_token_microbatch",
+                "zero_token_microbatch_index": index,
+                "microbatches": len(microbatches),
+            }
+
     model = trainer.model
     parameters = [p for p in model.parameters() if p.requires_grad]
     acc_sum = [None] * len(parameters)
     rlcr_sum = [None] * len(parameters)
     active_tokens = 0
 
-    for inputs in microbatches:
+    for index, inputs in enumerate(microbatches):
         loss_acc, loss_rlcr, token_count = trainer.compute_conflict_losses(
             model, inputs
         )
-        if token_count.item() == 0:
-            raise ValueError("A microbatch has no active completion tokens.")
-        active_tokens += int(token_count.item())
+        if int(token_count.item()) != token_counts[index]:
+            raise ValueError("Completion mask changed during diagnostic loss.")
+        active_tokens += token_counts[index]
 
         grad_acc = torch.autograd.grad(
             loss_acc, parameters, retain_graph=True, allow_unused=True

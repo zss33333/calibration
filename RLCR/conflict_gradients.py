@@ -9,6 +9,11 @@ def microbatch_projection(trainer, model, inputs):
                 "This first diagnostic step supports one process only."
             )
 
+    # Check before compute_conflict_losses, which cannot process an all-zero
+    # completion mask because its log-probability width would be zero.
+    if inputs["completion_mask"].sum().item() == 0:
+        return {"status": "no_valid_tokens", "active_tokens": 0}
+
     parameters = [p for p in model.parameters() if p.requires_grad]
     loss_acc, loss_rlcr, active_tokens = trainer.compute_conflict_losses(
         model, inputs
