@@ -3,6 +3,8 @@
 数学推理与置信度校准实验工作区，包含 DCPO 和 RLCR 的代码及本地环境配置。
 
 - `DCPO/`：Decoupled Calibration Policy Optimization，基于[作者仓库](https://github.com/icip-cas/DCPO)。本机环境使用方法见 [DCPO/setup/SETUP.md](DCPO/setup/SETUP.md)。
+- 双 L40 服务器上的 DCPO 运行与故障记录见 [L40_DCPO_RUN_NOTES.md](L40_DCPO_RUN_NOTES.md)。
+- Hopper H200 上的 DCPO 提交、环境验证与历史故障记录见 [HOPPER_H200_DCPO_RUNBOOK.md](HOPPER_H200_DCPO_RUNBOOK.md)。
 - `RLCR/`：Reinforcement Learning with Calibration Rewards，基于[作者仓库](https://github.com/damanimehul/RLCR)。包含本地保留的固定版本 TRL 依赖，使用方法见 [RLCR/README.md](RLCR/README.md)。
 
 两个项目以普通源码目录保存，克隆本仓库即可取得代码。各项目原有的版权、许可证和引用要求保留在对应目录中。

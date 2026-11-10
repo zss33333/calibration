@@ -15,7 +15,7 @@ def microbatch_projection(trainer, model, inputs):
         return {"status": "no_valid_tokens", "active_tokens": 0}
 
     parameters = [p for p in model.parameters() if p.requires_grad]
-    loss_acc, loss_rlcr, active_tokens = trainer.compute_conflict_losses(
+    loss_no_brier, loss_full, active_tokens = trainer.compute_conflict_losses(
         model, inputs
     )
 
@@ -23,58 +23,59 @@ def microbatch_projection(trainer, model, inputs):
         return {"status": "no_valid_tokens"}
 
     # Keep the shared forward graph for the second gradient calculation.
-    grad_acc = torch.autograd.grad(
-        loss_acc,
+    grad_no_brier = torch.autograd.grad(
+        loss_no_brier,
         parameters,
         retain_graph=True,
         allow_unused=True,
     )
-    acc_cpu = [
+    no_brier_cpu = [
         None if grad is None
         else grad.detach().to(device="cpu", dtype=torch.float32)
-        for grad in grad_acc
+        for grad in grad_no_brier
     ]
-    del grad_acc
+    del grad_no_brier
 
-    grad_rlcr = torch.autograd.grad(
-        loss_rlcr,
+    grad_full = torch.autograd.grad(
+        loss_full,
         parameters,
         allow_unused=True,
     )
 
     dot = 0.0
-    acc_norm_sq = 0.0
-    rlcr_norm_sq = 0.0
+    no_brier_norm_sq = 0.0
+    full_norm_sq = 0.0
 
-    for acc_grad, rlcr_grad in zip(acc_cpu, grad_rlcr):
-        if acc_grad is not None:
-            acc_norm_sq += torch.sum(acc_grad.double().square()).item()
+    for no_brier_grad, full_grad in zip(no_brier_cpu, grad_full):
+        if no_brier_grad is not None:
+            no_brier_norm_sq += torch.sum(no_brier_grad.double().square()).item()
 
-        if rlcr_grad is not None:
-            rlcr_cpu = rlcr_grad.detach().to(
+        if full_grad is not None:
+            full_cpu = full_grad.detach().to(
                 device="cpu", dtype=torch.float32
             )
-            rlcr_norm_sq += torch.sum(rlcr_cpu.double().square()).item()
+            full_norm_sq += torch.sum(full_cpu.double().square()).item()
 
-            if acc_grad is not None:
+            if no_brier_grad is not None:
                 dot += torch.sum(
-                    acc_grad.double() * rlcr_cpu.double()
+                    no_brier_grad.double() * full_cpu.double()
                 ).item()
 
-    if acc_norm_sq <= 1e-24:
+    if no_brier_norm_sq <= 1e-24:
         return {
-            "status": "zero_accuracy_gradient",
+            "status": "zero_no_brier_gradient",
             "active_tokens": active_tokens.item(),
-            "acc_norm_sq": acc_norm_sq,
+            "no_brier_norm_sq": no_brier_norm_sq,
         }
 
     return {
         "status": "ok",
         "active_tokens": active_tokens.item(),
         "dot": dot,
-        "acc_norm_sq": acc_norm_sq,
-        "rlcr_norm_sq": rlcr_norm_sq,
-        "D_bnpo": dot / acc_norm_sq,
-        "cosine": dot / (acc_norm_sq * rlcr_norm_sq) ** 0.5
-        if rlcr_norm_sq > 0 else float("nan"),
+        "no_brier_norm_sq": no_brier_norm_sq,
+        "full_norm_sq": full_norm_sq,
+        "D_full_on_no_brier": dot / no_brier_norm_sq,
+        "D_brier_contribution_on_no_brier": dot / no_brier_norm_sq - 1.0,
+        "cosine": dot / (no_brier_norm_sq * full_norm_sq) ** 0.5
+        if full_norm_sq > 0 else None,
     }

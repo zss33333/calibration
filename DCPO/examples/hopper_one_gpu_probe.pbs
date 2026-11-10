@@ -1,0 +1,157 @@
+#!/bin/bash
+#PBS -P CFP03-SF-101
+#PBS -q autox
+#PBS -j oe
+#PBS -k oed
+#PBS -N dcpo1chk
+#PBS -l walltime=02:00:00
+#PBS -l select=1:ngpus=1
+
+set -euo pipefail
+
+WORKDIR="/scratch/weiliu87/student/zss/calibration/DCPO"
+IMAGE="/app1/common/singularity-img/hopper/pytorch/pytorch_2.3.0_cuda_12.4_ngc_24.04.sif"
+test -r "$IMAGE" || { echo "Image missing: $IMAGE" >&2; exit 1; }
+test -x "$WORKDIR/.venv-hopper/bin/python" || {
+  echo "Virtualenv missing: $WORKDIR/.venv-hopper" >&2; exit 1;
+}
+cd "$WORKDIR"
+module load singularity
+
+singularity exec --nv -B /scratch:/scratch "$IMAGE" \
+  bash -s -- "$WORKDIR" "$PBS_JOBID" "${DCPO_PREFLIGHT_ONLY:-0}" <<'IN_CONTAINER'
+set -euo pipefail
+WORKDIR="$1"
+JOBID="$2"
+PREFLIGHT_ONLY="$3"
+JOB_NUM="${JOBID%%.*}"
+cd "$WORKDIR"
+source "$WORKDIR/.venv-hopper/bin/activate"
+
+CACHE_ROOT="/scratch/weiliu87/student/zss/cache/dcpo_probe/$JOBID"
+export HF_HOME="$CACHE_ROOT/huggingface"
+export HF_DATASETS_CACHE="$CACHE_ROOT/hf_datasets"
+export XDG_CACHE_HOME="$CACHE_ROOT/xdg"
+export TORCH_HOME="$CACHE_ROOT/torch"
+export TRITON_CACHE_DIR="$CACHE_ROOT/triton"
+export TORCHINDUCTOR_CACHE_DIR="$CACHE_ROOT/torchinductor"
+export TMPDIR="/scratch/weiliu87/student/zss/t$JOB_NUM"
+export RAY_TMPDIR="/scratch/weiliu87/student/zss/r$JOB_NUM"
+export DCPO_RAY_TEMP_DIR="$RAY_TMPDIR"
+export VLLM_USE_V1=0
+export PYTHONPATH="$WORKDIR${PYTHONPATH:+:$PYTHONPATH}"
+unset RAY_ADDRESS
+mkdir -p "$HF_HOME" "$HF_DATASETS_CACHE" "$XDG_CACHE_HOME" "$TORCH_HOME" \
+  "$TRITON_CACHE_DIR" "$TORCHINDUCTOR_CACHE_DIR" "$TMPDIR" "$RAY_TMPDIR"
+
+echo "PBS job: $JOBID"
+echo "Compute host: $(hostname)"
+echo "Python: $(command -v python)"
+echo "CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES:-<unset>}"
+echo "Triton cache: $TRITON_CACHE_DIR"
+nvidia-smi -L
+
+PREFLIGHT_SCRIPT="$WORKDIR/scripts/preflight_hopper.py"
+if [[ ! -f "$PREFLIGHT_SCRIPT" ]]; then
+  echo "Preflight script is not a regular file on this compute node: $PREFLIGHT_SCRIPT" >&2
+  ls -ld "$WORKDIR" "$WORKDIR/scripts" "$PREFLIGHT_SCRIPT" >&2 || true
+  if [[ -L "$PREFLIGHT_SCRIPT" ]]; then
+    echo "Symlink target: $(readlink "$PREFLIGHT_SCRIPT")" >&2
+  fi
+  exit 2
+fi
+stat -c 'Preflight script: %n | %s bytes | modified %y' "$PREFLIGHT_SCRIPT"
+python "$PREFLIGHT_SCRIPT" ray
+python "$PREFLIGHT_SCRIPT" compute --expected-gpus 1
+
+# Fast compute-node check of the historical vLLM UUID, Ray and Triton failures.
+# Pass DCPO_PREFLIGHT_ONLY=1 with qsub to stop before loading the training model.
+if [[ "$PREFLIGHT_ONLY" == 1 ]]; then
+  echo "HOPPER_PREFLIGHT_ONLY_PASSED"
+  exit 0
+fi
+
+# One disposable end-to-end step: model load, Ray/FSDP, vLLM rollout,
+# reward, backward/update, validation, and checkpoint. No official run is resumed.
+RUN_NAME="Qwen3-8B_HOPPER_PROBE_$JOB_NUM"
+RUN_DIR="$WORKDIR/checkpoints/MATH/$RUN_NAME"
+mkdir -p "$RUN_DIR"
+python - "$RUN_DIR/aime24_first_8.parquet" <<'PY'
+import sys
+import pyarrow.parquet as pq
+table = pq.read_table('data/test_data/aime24_repeated_8_times.parquet').slice(0, 8)
+assert table.num_rows == 8
+pq.write_table(table, sys.argv[1])
+PY
+
+probe_args=( \
+  algorithm.adv_estimator=confidence \
+  reward_model.reward_manager=hybrid \
+  algorithm.use_kl_in_reward=False \
+  "data.train_files=['data/deepscaler_uniform_train_with_confidence.parquet']" \
+  "data.val_files=['$RUN_DIR/aime24_first_8.parquet']" \
+  data.train_batch_size=2 \
+  data.max_prompt_length=1024 \
+  data.max_response_length=256 \
+  data.filter_overlong_prompts=True \
+  +data.apply_chat_template_kwargs.enable_thinking=False \
+  data.truncation=error \
+  data.shuffle=False \
+  "data.save_dir=$RUN_DIR/validation_logs" \
+  actor_rollout_ref.model.path=models/Qwen3-8B \
+  actor_rollout_ref.model.use_remove_padding=True \
+  actor_rollout_ref.model.enable_gradient_checkpointing=True \
+  actor_rollout_ref.actor.loss_agg_mode=seq-mean-token-mean \
+  actor_rollout_ref.actor.optim.lr=1e-6 \
+  actor_rollout_ref.actor.ppo_mini_batch_size=2 \
+  actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 \
+  actor_rollout_ref.actor.use_torch_compile=True \
+  actor_rollout_ref.actor.use_kl_loss=False \
+  actor_rollout_ref.actor.kl_loss_coef=0.0 \
+  actor_rollout_ref.actor.entropy_coeff=0 \
+  actor_rollout_ref.actor.clip_ratio_low=0.2 \
+  actor_rollout_ref.actor.clip_ratio_high=0.28 \
+  +actor_rollout_ref.actor.fsdp_config.model_dtype=bf16 \
+  actor_rollout_ref.actor.fsdp_config.param_offload=True \
+  actor_rollout_ref.actor.fsdp_config.optimizer_offload=True \
+  "actor_rollout_ref.actor.output_dir_of_record=$RUN_DIR/reward_data" \
+  actor_rollout_ref.rollout.name=vllm \
+  actor_rollout_ref.rollout.temperature=1.0 \
+  actor_rollout_ref.rollout.n=8 \
+  actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
+  actor_rollout_ref.rollout.gpu_memory_utilization=0.35 \
+  actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1 \
+  actor_rollout_ref.rollout.load_format=safetensors \
+  actor_rollout_ref.rollout.enforce_eager=True \
+  actor_rollout_ref.rollout.free_cache_engine=True \
+  actor_rollout_ref.rollout.max_num_batched_tokens=2048 \
+  actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=1 \
+  actor_rollout_ref.ref.fsdp_config.param_offload=True \
+  trainer.critic_warmup=0 \
+  'trainer.logger=["console"]' \
+  trainer.project_name=verl_dcpo_hopper_probe \
+  "trainer.experiment_name=$RUN_NAME" \
+  trainer.n_gpus_per_node=1 \
+  trainer.nnodes=1 \
+  trainer.val_before_train=False \
+  trainer.resume_mode=disable \
+  "trainer.default_local_dir=$RUN_DIR" \
+  trainer.save_freq=1 \
+  trainer.test_freq=1 \
+  trainer.total_epochs=1 \
+  trainer.total_training_steps=1
+)
+
+python -m verl.trainer.main_ppo "${probe_args[@]}"
+
+test -s "$RUN_DIR/latest_checkpointed_iteration.txt"
+test "$(cat "$RUN_DIR/latest_checkpointed_iteration.txt")" = 1
+test -s "$RUN_DIR/global_step_1/actor/model_world_size_1_rank_0.pt"
+if [[ "${DCPO_CHECK_RESUME:-1}" == 1 ]]; then
+  python -m verl.trainer.main_ppo "${probe_args[@]}" \
+    trainer.resume_mode=auto trainer.total_training_steps=2
+  test "$(cat "$RUN_DIR/latest_checkpointed_iteration.txt")" = 2
+  test -s "$RUN_DIR/global_step_2/actor/model_world_size_1_rank_0.pt"
+fi
+echo "HOPPER_ONE_GPU_PROBE_PASSED"
+IN_CONTAINER

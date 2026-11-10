@@ -77,7 +77,10 @@ def main(script_args, training_args, model_args):
     }
     reward_funcs = [REWARD_FUNCS_REGISTRY[func] for func in script_args.reward_funcs]
 
-    dataset = process_dataset(dataset, script_args)  
+    # All ranks share the same datasets cache. Let rank 0 write map() results
+    # before the other ranks load them to avoid concurrent writes to one file.
+    with training_args.main_process_first(local=False, desc="process dataset"):
+        dataset = process_dataset(dataset, script_args)
 
     for split in dataset:
         if "messages" in dataset[split].column_names:
@@ -95,6 +98,13 @@ def main(script_args, training_args, model_args):
         train_dataset = train_dataset.select(range(script_args.train_subset_size))
     if script_args.eval_subset_size is not None:
         eval_dataset = eval_dataset.select(range(script_args.eval_subset_size))
+    if training_args.conflict_diagnostic:
+        missing = {"answer", "source"} - set(train_dataset.column_names)
+        if missing:
+            raise ValueError(f"Conflict diagnosis requires dataset columns: {sorted(missing)}")
+        sources = set(train_dataset.unique("source"))
+        if sources != {"hotpot"}:
+            raise ValueError(f"Conflict diagnosis requires HotpotQA source, got: {sources!r}")
         
     #############################
     # Initialize the GRPO trainer

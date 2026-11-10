@@ -1,4 +1,5 @@
 set -x
+set -o pipefail
 export PYTHONHASHSEED=0
 export RAY_memory_monitor_refresh_ms=0
 
@@ -9,12 +10,12 @@ deepscaler_uniform_train_path=data/deepscaler_uniform_train_with_confidence.parq
 train_files="['$deepscaler_uniform_train_path']"
 test_files="['$aime24_test_path']"
 
-EXP_NAME='Qwen3-8B_DCPO'
+EXP_NAME="${DCPO_EXP_NAME:-Qwen3-8B_DCPO}"
 OUTPUT_DIR="checkpoints/MATH/${EXP_NAME}"
-mkdir -p ${OUTPUT_DIR}
+mkdir -p "${OUTPUT_DIR}"
 
 VAL_OUTPUT_DIR="${OUTPUT_DIR}/validation"
-mkdir -p ${VAL_OUTPUT_DIR}
+mkdir -p "${VAL_OUTPUT_DIR}"
 
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=confidence \
@@ -63,7 +64,7 @@ python3 -m verl.trainer.main_ppo \
     trainer.nnodes=1 \
     trainer.save_freq=20 \
     trainer.test_freq=5 \
-    trainer.total_epochs=5 $@ 2>&1 | tee ${OUTPUT_DIR}/training_process.log
+    trainer.total_epochs=5 "$@" 2>&1 | tee "${OUTPUT_DIR}/training_process.log"
 
     # actor_rollout_ref.actor.ppo_mini_batch_size=256 \
     # data.train_batch_size=1024 \

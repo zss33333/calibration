@@ -18,6 +18,7 @@ The main entry point to run the PPO algorithm
 import logging
 import os
 import warnings
+from datetime import timedelta
 import psutil
 
 import torch
@@ -78,7 +79,12 @@ class ActorRolloutRefWorker(Worker):
         self.config = config
         import torch.distributed
         if not torch.distributed.is_initialized():
-            torch.distributed.init_process_group()
+            timeout_seconds = os.environ.get('DCPO_DISTRIBUTED_TIMEOUT_SECONDS')
+            if timeout_seconds:
+                torch.distributed.init_process_group(
+                    timeout=timedelta(seconds=int(timeout_seconds)))
+            else:
+                torch.distributed.init_process_group()
 
         # build device mesh for FSDP
         world_size = torch.distributed.get_world_size()
@@ -216,7 +222,22 @@ class ActorRolloutRefWorker(Worker):
 
             if enable_gradient_checkpointing:
                 actor_module.gradient_checkpointing_enable(gradient_checkpointing_kwargs={'use_reentrant': False})
-        torch.distributed.barrier()
+        # At this point NCCL has not necessarily seen a tensor on this rank.
+        # Ray exposes one GPU per worker, so explicitly use that worker's
+        # local CUDA device for the first barrier after loading model shards.
+        barrier_device = torch.cuda.current_device()
+        print(
+            f"[model-load barrier] rank={torch.distributed.get_rank()} "
+            f"device={barrier_device} "
+            f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '')} "
+            "enter",
+            flush=True,
+        )
+        torch.distributed.barrier(device_ids=[barrier_device])
+        print(
+            f"[model-load barrier] rank={torch.distributed.get_rank()} exit",
+            flush=True,
+        )
 
         if self.rank == 0:
             print_model_size(actor_module)
@@ -452,7 +473,16 @@ class ActorRolloutRefWorker(Worker):
             data = self.ulysses_sharding_manager.preprocess_data(data=data)
             # perform training
             with Timer(name='update_policy', logger=None) as timer:
-                metrics = self.actor.update_policy(data=data)
+                try:
+                    metrics = self.actor.update_policy(data=data)
+                except Exception as exc:
+                    # Ray cannot deserialize some compiler exceptions. Print the
+                    # original traceback in this worker before crossing Ray RPC.
+                    import traceback
+                    traceback.print_exc()
+                    raise RuntimeError(
+                        f"Actor update failed: {type(exc).__name__}: {exc}"
+                    ) from None
             delta_time = timer.last
             global_num_tokens = data.meta_info['global_token_num']
             estimated_flops, promised_flops = self.flops_counter.estimate_flops(global_num_tokens, delta_time)
@@ -524,6 +554,17 @@ class ActorRolloutRefWorker(Worker):
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def compute_log_prob(self, data: DataProto):
+        try:
+            return self._compute_log_prob_impl(data)
+        except Exception as exc:
+            # Keep the original exception on this worker before Ray serializes it.
+            import traceback
+            traceback.print_exc()
+            raise RuntimeError(
+                f"Actor log-prob computation failed: {type(exc).__name__}: {exc}"
+            ) from None
+
+    def _compute_log_prob_impl(self, data: DataProto):
         assert self._is_actor
         if self._is_offload_param:
             load_fsdp_model_to_gpu(self.actor_module_fsdp)
@@ -570,7 +611,14 @@ class ActorRolloutRefWorker(Worker):
         data.meta_info['use_dynamic_bsz'] = self.config.ref.log_prob_use_dynamic_bsz
         with self.ulysses_sharding_manager:
             data = self.ulysses_sharding_manager.preprocess_data(data)
-            output = self.ref_policy.compute_log_prob(data=data)
+            try:
+                output = self.ref_policy.compute_log_prob(data=data)
+            except Exception as exc:
+                import traceback
+                traceback.print_exc()
+                raise RuntimeError(
+                    f"Reference log-prob computation failed: {type(exc).__name__}: {exc}"
+                ) from None
             output = DataProto.from_dict(tensors={'ref_log_prob': output})
             output = self.ulysses_sharding_manager.postprocess_data(output)
 

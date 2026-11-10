@@ -44,74 +44,75 @@ def accumulated_projection(trainer, microbatches):
 
     model = trainer.model
     parameters = [p for p in model.parameters() if p.requires_grad]
-    acc_sum = [None] * len(parameters)
-    rlcr_sum = [None] * len(parameters)
+    no_brier_sum = [None] * len(parameters)
+    full_sum = [None] * len(parameters)
     active_tokens = 0
 
     for index, inputs in enumerate(microbatches):
-        loss_acc, loss_rlcr, token_count = trainer.compute_conflict_losses(
+        loss_no_brier, loss_full, token_count = trainer.compute_conflict_losses(
             model, inputs
         )
         if int(token_count.item()) != token_counts[index]:
             raise ValueError("Completion mask changed during diagnostic loss.")
         active_tokens += token_counts[index]
 
-        grad_acc = torch.autograd.grad(
-            loss_acc, parameters, retain_graph=True, allow_unused=True
+        grad_no_brier = torch.autograd.grad(
+            loss_no_brier, parameters, retain_graph=True, allow_unused=True
         )
-        for i, grad in enumerate(grad_acc):
+        for i, grad in enumerate(grad_no_brier):
             if grad is not None:
                 value = grad.detach().to(device="cpu", dtype=torch.float32)
-                if acc_sum[i] is None:
-                    acc_sum[i] = value
+                if no_brier_sum[i] is None:
+                    no_brier_sum[i] = value
                 else:
-                    acc_sum[i].add_(value)
-        del grad_acc
+                    no_brier_sum[i].add_(value)
+        del grad_no_brier
 
-        grad_rlcr = torch.autograd.grad(
-            loss_rlcr, parameters, allow_unused=True
+        grad_full = torch.autograd.grad(
+            loss_full, parameters, allow_unused=True
         )
-        for i, grad in enumerate(grad_rlcr):
+        for i, grad in enumerate(grad_full):
             if grad is not None:
                 value = grad.detach().to(device="cpu", dtype=torch.float32)
-                if rlcr_sum[i] is None:
-                    rlcr_sum[i] = value
+                if full_sum[i] is None:
+                    full_sum[i] = value
                 else:
-                    rlcr_sum[i].add_(value)
-        del grad_rlcr, loss_acc, loss_rlcr
+                    full_sum[i].add_(value)
+        del grad_full, loss_no_brier, loss_full
 
     dot = 0.0
-    acc_norm_sq = 0.0
-    rlcr_norm_sq = 0.0
-    for acc_grad, rlcr_grad in zip(acc_sum, rlcr_sum):
-        if acc_grad is not None:
-            acc_norm_sq += torch.sum(acc_grad.double().square()).item()
-        if rlcr_grad is not None:
-            rlcr_norm_sq += torch.sum(rlcr_grad.double().square()).item()
-        if acc_grad is not None and rlcr_grad is not None:
+    no_brier_norm_sq = 0.0
+    full_norm_sq = 0.0
+    for no_brier_grad, full_grad in zip(no_brier_sum, full_sum):
+        if no_brier_grad is not None:
+            no_brier_norm_sq += torch.sum(no_brier_grad.double().square()).item()
+        if full_grad is not None:
+            full_norm_sq += torch.sum(full_grad.double().square()).item()
+        if no_brier_grad is not None and full_grad is not None:
             dot += torch.sum(
-                acc_grad.double() * rlcr_grad.double()
+                no_brier_grad.double() * full_grad.double()
             ).item()
 
     result = {
         "active_tokens": active_tokens,
         "microbatches": len(microbatches),
         "dot": dot,
-        "acc_norm_sq": acc_norm_sq,
-        "rlcr_norm_sq": rlcr_norm_sq,
+        "no_brier_norm_sq": no_brier_norm_sq,
+        "full_norm_sq": full_norm_sq,
     }
-    if not all(math.isfinite(x) for x in (dot, acc_norm_sq, rlcr_norm_sq)):
+    if not all(math.isfinite(x) for x in (dot, no_brier_norm_sq, full_norm_sq)):
         result["status"] = "nonfinite_gradient"
         return result
-    if acc_norm_sq <= 1e-24:
-        result["status"] = "zero_accuracy_gradient"
+    if no_brier_norm_sq <= 1e-24:
+        result["status"] = "zero_no_brier_gradient"
         return result
 
     result.update({
         "status": "ok",
-        "D_bnpo": dot / acc_norm_sq,
-        "cosine": dot / (acc_norm_sq * rlcr_norm_sq) ** 0.5
-        if rlcr_norm_sq > 0 else None,
+        "D_full_on_no_brier": dot / no_brier_norm_sq,
+        "D_brier_contribution_on_no_brier": dot / no_brier_norm_sq - 1.0,
+        "cosine": dot / (no_brier_norm_sq * full_norm_sq) ** 0.5
+        if full_norm_sq > 0 else None,
     })
     return result
 
@@ -208,7 +209,7 @@ def main():
         "num_groups": num_groups,
         "microbatch_size": training_args.per_device_train_batch_size,
         "projection_scope": "full_accumulation_window",
-        "reward_scope": "configured_weighted_rewards",
+        "reward_scope": "weighted_without_brier_vs_weighted_full",
     })
     print(json.dumps(result, ensure_ascii=False))
 

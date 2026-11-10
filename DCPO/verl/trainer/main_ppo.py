@@ -56,19 +56,29 @@ def main(config):
     run_ppo(config)
 
 
+@ray.remote(num_cpus=1)
+def _ray_startup_ping():
+    return os.getpid()
+
+
 def run_ppo(config) -> None:
     # TODO(linjunrong.ocss884): this ENV is left for resolving SGLang conflict with ray devices
     # isolation, will solve in the future
     os.environ["ENSURE_CUDA_VISIBLE_DEVICES"] = os.environ.get('CUDA_VISIBLE_DEVICES', '')
     if not ray.is_initialized():
         # this is for local ray cluster
-        ray.init(_temp_dir=os.environ.get('DCPO_RAY_TEMP_DIR'), runtime_env={
+        ray_num_cpus = os.environ.get('DCPO_RAY_NUM_CPUS')
+        ray.init(_temp_dir=os.environ.get('DCPO_RAY_TEMP_DIR'),
+                 num_cpus=int(ray_num_cpus) if ray_num_cpus else None,
+                 runtime_env={
             'env_vars': {
                 'TOKENIZERS_PARALLELISM': 'true',
                 'NCCL_DEBUG': os.environ.get('NCCL_DEBUG', 'WARN'),
                 'VLLM_LOGGING_LEVEL': 'WARN'
             }
         })
+        print(f"Ray cluster resources: {ray.cluster_resources()}", flush=True)
+        print(f"Ray startup worker PID: {ray.get(_ray_startup_ping.remote(), timeout=300)}", flush=True)
 
     runner = TaskRunner.remote()
     ray.get(runner.run.remote(config))

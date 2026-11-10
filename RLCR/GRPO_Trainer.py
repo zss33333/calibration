@@ -712,25 +712,26 @@ class CustomTrainer(Trainer):
             if any(example.get("source") != "hotpot" for example in inputs):
                 raise ValueError("The conflict diagnostic expects HotpotQA inputs.")
 
-            # rewards_per_func 已由训练所用的原始奖励函数计算并 gather。
-            # accuracy_reward 对格式无效的回答给 C=0。
-            accuracy_index = self.reward_func_names.index("accuracy_reward")
-            c_all = rewards_per_func[:, accuracy_index]
-
-            # 实际加权奖励若非有限值，原训练也无法得到有效梯度；
-            # 此处报错，不用填充值改变它。
+            # Compare the actual weighted reward with the same reward minus
+            # its weighted Brier term. Both use this rollout and group baseline.
             if not torch.isfinite(rewards).all():
                 raise ValueError("Actual weighted RLCR rewards contain NaN or Inf.")
-            if not torch.isfinite(c_all).all():
-                raise ValueError("Accuracy rewards contain NaN or Inf.")
-
-            grouped_c = c_all.view(-1, self.num_generations)
-            acc_adv_all = (
-                grouped_c - grouped_c.mean(dim=1, keepdim=True)
+            brier_index = self.reward_func_names.index("brier_reward")
+            b_all = rewards_per_func[:, brier_index]
+            if not torch.isfinite(b_all).all():
+                raise ValueError("Brier rewards contain NaN or Inf.")
+            no_brier_weights = self.reward_weights.to(device).clone()
+            no_brier_weights[brier_index] = 0.0
+            no_brier_rewards = (
+                rewards_per_func * no_brier_weights.unsqueeze(0)
+            ).sum(dim=1)
+            grouped_no_brier = no_brier_rewards.view(-1, self.num_generations)
+            no_brier_adv_all = (
+                grouped_no_brier - grouped_no_brier.mean(dim=1, keepdim=True)
             ).reshape(-1)
 
             diagnostic_tensors = {
-                "diagnostic_adv_acc": acc_adv_all[process_slice],
+                "diagnostic_adv_no_brier": no_brier_adv_all[process_slice],
             }
 
 
@@ -786,9 +787,7 @@ class CustomTrainer(Trainer):
 
     def compute_conflict_losses(self, model, inputs):
         """Build paired BNPO losses without changing the training loss."""
-        required = (
-            "diagnostic_adv_acc",
-        )
+        required = ("diagnostic_adv_no_brier", "advantages")
         if any(key not in inputs for key in required):
             raise ValueError("Paired diagnostic tensors are missing.")
 
@@ -842,10 +841,10 @@ class CustomTrainer(Trainer):
             per_token_loss = -torch.min(per_token_loss1, per_token_loss2)
             return (per_token_loss * completion_mask).sum() / denominator
 
-        loss_acc = bnpo_loss(inputs["diagnostic_adv_acc"])
-        loss_rlcr = bnpo_loss(inputs["advantages"])
+        loss_no_brier = bnpo_loss(inputs["diagnostic_adv_no_brier"])
+        loss_full = bnpo_loss(inputs["advantages"])
 
-        return loss_acc, loss_rlcr, completion_mask.sum()
+        return loss_no_brier, loss_full, completion_mask.sum()
 
     @profiling_decorator
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):

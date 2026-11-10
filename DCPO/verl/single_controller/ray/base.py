@@ -460,6 +460,14 @@ def create_colocated_worker_cls(class_dict: dict[str, RayClassWithInitArgs]):
     class WorkerDict(worker_cls):
 
         def __init__(self):
+            triton_cache_root = os.environ.get('DCPO_TRITON_CACHE_ROOT')
+            if triton_cache_root:
+                # A Ray actor is one process. Separate its Triton JIT writes from
+                # other ranks compiling the same kernel on a shared filesystem.
+                triton_cache_dir = os.path.join(triton_cache_root, str(os.getpid()))
+                os.makedirs(triton_cache_dir, exist_ok=True)
+                os.environ['TRITON_CACHE_DIR'] = triton_cache_dir
+                print(f'Ray worker Triton cache: {triton_cache_dir}', flush=True)
             super().__init__()
             self.worker_dict = {}
             for key, user_defined_cls in cls_dict.items():

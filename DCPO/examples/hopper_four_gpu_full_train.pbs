@@ -1,0 +1,130 @@
+#!/bin/bash
+#PBS -P CFP03-SF-101
+#PBS -q autox
+#PBS -j oe
+#PBS -k oed
+#PBS -N dcpo4full
+#PBS -l walltime=48:00:00
+#PBS -l select=1:ngpus=4
+
+set -euo pipefail
+
+WORKDIR="/scratch/weiliu87/student/zss/calibration/DCPO"
+IMAGE="/app1/common/singularity-img/hopper/pytorch/pytorch_2.3.0_cuda_12.4_ngc_24.04.sif"
+test -r "$IMAGE" || { echo "Image missing: $IMAGE" >&2; exit 1; }
+test -x "$WORKDIR/.venv-hopper/bin/python" || {
+  echo "Virtualenv missing: $WORKDIR/.venv-hopper" >&2; exit 1;
+}
+cd "$WORKDIR"
+module load singularity
+
+singularity exec --nv -B /scratch:/scratch "$IMAGE" \
+  bash -s -- "$WORKDIR" "$PBS_JOBID" <<'IN_CONTAINER'
+set -euo pipefail
+WORKDIR="$1"
+JOBID="$2"
+JOB_NUM="${JOBID%%.*}"
+cd "$WORKDIR"
+source "$WORKDIR/.venv-hopper/bin/activate"
+
+CACHE_ROOT="/scratch/weiliu87/student/zss/cache/dcpo_train4/$JOBID"
+export HF_HOME="$CACHE_ROOT/huggingface"
+export HF_DATASETS_CACHE="$CACHE_ROOT/hf_datasets"
+export XDG_CACHE_HOME="$CACHE_ROOT/xdg"
+export TORCH_HOME="$CACHE_ROOT/torch"
+export TRITON_CACHE_DIR="$CACHE_ROOT/triton-preflight"
+export DCPO_TRITON_CACHE_ROOT="$CACHE_ROOT/triton-workers"
+export TORCHINDUCTOR_CACHE_DIR="$CACHE_ROOT/torchinductor"
+export TMPDIR="/scratch/weiliu87/student/zss/t$JOB_NUM"
+export RAY_TMPDIR="/scratch/weiliu87/student/zss/r$JOB_NUM"
+export DCPO_RAY_TEMP_DIR="$RAY_TMPDIR"
+export DCPO_RAY_NUM_CPUS=48
+export VLLM_USE_V1=0
+export RAY_DEDUP_LOGS=0
+export HYDRA_FULL_ERROR=1
+export PYTHONUNBUFFERED=1
+export PYTHONPATH="$WORKDIR${PYTHONPATH:+:$PYTHONPATH}"
+unset RAY_ADDRESS
+mkdir -p "$HF_HOME" "$HF_DATASETS_CACHE" "$XDG_CACHE_HOME" "$TORCH_HOME" \
+  "$TRITON_CACHE_DIR" "$DCPO_TRITON_CACHE_ROOT" "$TORCHINDUCTOR_CACHE_DIR" "$TMPDIR" "$RAY_TMPDIR"
+
+RUN_NAME="Qwen3-8B_HOPPER_4GPU_FULL"
+RUN_DIR="$WORKDIR/checkpoints/MATH/$RUN_NAME"
+export DCPO_EXP_NAME="$RUN_NAME"
+mkdir -p "$RUN_DIR"
+if [[ -f "$RUN_DIR/training_process.log" ]] && \
+   grep -q 'Final validation metrics' "$RUN_DIR/training_process.log"; then
+  echo "Full training already completed in $RUN_DIR"
+  exit 0
+fi
+# The wrapper uses tee without -a. Keep each previous submission's log before
+# resuming the same checkpoint directory in a later PBS job.
+if [[ -f "$RUN_DIR/training_process.log" ]]; then
+  mv "$RUN_DIR/training_process.log" "$RUN_DIR/training_process.before_$JOB_NUM.log"
+fi
+
+echo "PBS job: $JOBID"
+echo "Compute host: $(hostname)"
+echo "Python: $(command -v python)"
+echo "Python3: $(command -v python3)"
+echo "CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES:-<unset>}"
+echo "Run directory: $RUN_DIR"
+echo "Ray directory: $DCPO_RAY_TEMP_DIR"
+nvidia-smi -L
+
+test -f "$WORKDIR/scripts/preflight_hopper.py"
+test -f "$WORKDIR/examples/Qwen3-8B.sh"
+grep -Fq 'DCPO_EXP_NAME' "$WORKDIR/examples/Qwen3-8B.sh" || {
+  echo "Qwen3-8B.sh lacks per-run DCPO_EXP_NAME; sync the updated wrapper first" >&2
+  exit 2
+}
+grep -Fq '"$@"' "$WORKDIR/examples/Qwen3-8B.sh" || {
+  echo "Qwen3-8B.sh does not forward command-line overrides" >&2
+  exit 2
+}
+# Ray also honors RAY_TMPDIR directly. Older Hopper runs already wrote their
+# sessions under /scratch/weiliu87/student/zss/r<job>/ray without a main_ppo patch.
+for setting in \
+  'data.train_batch_size=256' \
+  'data.max_response_length=3000' \
+  'actor_rollout_ref.actor.ppo_mini_batch_size=64' \
+  'actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=8' \
+  'actor_rollout_ref.rollout.gpu_memory_utilization=0.6' \
+  'actor_rollout_ref.rollout.n=8' \
+  'trainer.test_freq=5' \
+  'trainer.total_epochs=5'; do
+  grep -Fq "$setting" "$WORKDIR/examples/Qwen3-8B.sh" || {
+    echo "Original training setting missing from Qwen3-8B.sh: $setting" >&2
+    exit 2
+  }
+done
+python "$WORKDIR/scripts/preflight_hopper.py" compute --expected-gpus 4
+
+# Full five-epoch Qwen3-8B DCPO run on four GPUs. Preserve the verified
+# eager actor entropy path and use the original validation and batch settings.
+bash -o pipefail examples/Qwen3-8B.sh \
+  "data.save_dir=$RUN_DIR/validation_logs" \
+  "actor_rollout_ref.actor.output_dir_of_record=$RUN_DIR/reward_data" \
+  trainer.n_gpus_per_node=4 \
+  trainer.nnodes=1 \
+  actor_rollout_ref.actor.use_torch_compile=False \
+  trainer.resume_mode=auto \
+  'trainer.logger=["console"]' \
+  "trainer.default_local_dir=$RUN_DIR" \
+  trainer.save_freq=20
+
+test -s "$RUN_DIR/latest_checkpointed_iteration.txt"
+FINAL_STEP="$(cat "$RUN_DIR/latest_checkpointed_iteration.txt")"
+[[ "$FINAL_STEP" =~ ^[1-9][0-9]*$ ]]
+test -s "$RUN_DIR/global_step_$FINAL_STEP/data.pt"
+for rank in 0 1 2 3; do
+  for part in model optim extra_state; do
+    test -s "$RUN_DIR/global_step_$FINAL_STEP/actor/${part}_world_size_4_rank_${rank}.pt"
+  done
+done
+test -s "$RUN_DIR/reward_data/batch_data_step_${FINAL_STEP}.json"
+grep -q 'Final validation metrics' "$RUN_DIR/training_process.log"
+
+echo "HOPPER_4GPU_FULL_TRAIN_PASSED: final step $FINAL_STEP"
+echo "Run directory: $RUN_DIR"
+IN_CONTAINER

@@ -62,7 +62,7 @@ def format_reward(format_pattern,completions, **kwargs):
                 else:
                     try:
                         confidence = float(last_confidence)
-                        if confidence < 0 or confidence >1:
+                        if not math.isfinite(confidence) or confidence < 0 or confidence > 1:
                             matches[i] = 0.0
                         else:
                             matches[i] = 1
@@ -177,7 +177,7 @@ def mean_confidence_reward(completions,answer, **kwargs):
             try:
                 confidence = float(last_confidence)
                 #clip confidence to be between 0 and 1
-                confidence = max(0.0, min(confidence, 1.0))
+                confidence = max(0.0, min(confidence, 1.0)) if math.isfinite(confidence) else 0.0
             except:
                 confidence = 0.0
             matches.append(confidence)
@@ -198,10 +198,14 @@ def confidence_one_or_zero(completions,answer, **kwargs):
         else:
             try:
                 confidence = float(last_confidence)
-                #clip confidence to be between 0 and 1
-                confidence = max(0.0, min(confidence, 1.0))
             except:
-                confidence = 0.0
+                matches.append(0.0)
+                continue
+            if not math.isfinite(confidence):
+                matches.append(0.0)
+                continue
+            #clip confidence to be between 0 and 1
+            confidence = max(0.0, min(confidence, 1.0))
             if abs(confidence - 1) < 0.01 or abs(confidence - 0) < 0.01:
                 matches.append(1.0)
             else:
