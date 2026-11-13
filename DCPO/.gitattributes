@@ -1,0 +1,2 @@
+examples/Qwen3-8B_RLCR.sh text eol=lf
+examples/hopper_rlcr_full_train.pbs text eol=lf

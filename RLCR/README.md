@@ -60,6 +60,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 accelerate launch --num_processes 4 --config_file d
 
 - Wandb logs from reproduced runs available [here](https://wandb.ai/mehuldamani/RLCR?nw=nwusermehuldamani). Intermediate generations are also logged and are useful for debugging. 
 - Additional training scripts are available in `train_runs.sh`.
+- For a HotpotQA reproduction and accuracy/Brier reward-weight sweep using only the standard training entry point, see [HOTPOT_WEIGHT_REPRO.md](HOTPOT_WEIGHT_REPRO.md).
 - All training configurations are defined in the `configs/` directory. New configs can be added to support custom training setups.
 - **Compute details**:
   - We ran HotpotQA experiments on **4×A100 GPUs**

@@ -137,6 +137,10 @@ def main(script_args, training_args, model_args):
         print("Failed to save state, please debug")
         pass
 
+    if os.environ.get("RLCR_SKIP_FINAL_MODEL_SAVE") == "1":
+        logger.info("Skipping final model save for diagnostic probe")
+        return
+
     ##################################
     # Save model and create model card
     ##################################

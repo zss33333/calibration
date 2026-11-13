@@ -1,0 +1,277 @@
+#!/bin/bash
+#PBS -P CFP03-SF-101
+#PBS -q autox
+#PBS -j oe
+#PBS -k oed
+#PBS -N rlcr4weight
+#PBS -l walltime=24:00:00
+#PBS -l select=1:ngpus=4
+
+set -euo pipefail
+
+ROOT=/scratch/weiliu87/student/zss/calibration
+WORKDIR="$ROOT/RLCR"
+IMAGE=/app1/common/singularity-img/hopper/pytorch/pytorch_2.3.0_cuda_12.4_ngc_24.04.sif
+LAMBDA="${RLCR_LAMBDA:-0.50}"
+MAX_STEPS="${RLCR_MAX_STEPS:--1}"
+PREFLIGHT_ONLY="${RLCR_PREFLIGHT_ONLY:-0}"
+case "$LAMBDA" in
+  0.00|0.25|0.50|0.75|1.00) ;;
+  *) echo "Invalid RLCR_LAMBDA: $LAMBDA" >&2; exit 2 ;;
+esac
+case "$MAX_STEPS" in
+  -1|1) ;;
+  *) echo "RLCR_MAX_STEPS must be -1 or 1" >&2; exit 2 ;;
+esac
+case "$PREFLIGHT_ONLY" in
+  0|1) ;;
+  *) echo "RLCR_PREFLIGHT_ONLY must be 0 or 1" >&2; exit 2 ;;
+esac
+test -r "$IMAGE"
+test -x "$WORKDIR/.venv-hopper-rlcr/bin/python"
+test -f "$WORKDIR/official_upstream/configs/Qwen-7B/hotpot/RLCR.yaml"
+test -f "$WORKDIR/official_upstream/SHA256SUMS"
+test -f "$WORKDIR/hopper_official_runner.py"
+test -f "$WORKDIR/local_configs/hopper-four-gpu-full-step.yaml"
+test -f "$ROOT/DCPO/scripts/fix_vllm_uuid.py"
+module load singularity
+
+singularity exec --nv -B /scratch:/scratch "$IMAGE" \
+  bash -s -- "$ROOT" "$PBS_JOBID" "$LAMBDA" "$MAX_STEPS" "$PREFLIGHT_ONLY" <<'IN_CONTAINER'
+set -euo pipefail
+ROOT="$1"
+JOBID="$2"
+LAMBDA="$3"
+MAX_STEPS="$4"
+PREFLIGHT_ONLY="$5"
+WORKDIR="$ROOT/RLCR"
+cd "$WORKDIR"
+source "$WORKDIR/.venv-hopper-rlcr/bin/activate"
+cd "$WORKDIR/official_upstream"
+sha256sum -c SHA256SUMS
+cd "$WORKDIR"
+export PYTHONUNBUFFERED=1
+export TOKENIZERS_PARALLELISM=false
+export RAY_DEDUP_LOGS=0
+unset RLCR_SKIP_FINAL_MODEL_SAVE
+command -v flock >/dev/null
+
+JOB_NUM="${JOBID%%.*}"
+CACHE_ROOT="/scratch/weiliu87/student/zss/cache/rlcr_weight/$JOBID"
+export HF_HOME="$CACHE_ROOT/huggingface"
+export HF_DATASETS_CACHE="$CACHE_ROOT/hf_datasets"
+export XDG_CACHE_HOME="$CACHE_ROOT/xdg"
+export TRITON_CACHE_DIR="$CACHE_ROOT/triton"
+export TMPDIR="/scratch/weiliu87/student/zss/t_rlcr_$JOB_NUM"
+export RLCR_RANK_RUNTIME_ROOT="$CACHE_ROOT/ranks"
+export RLCR_RAY_TMP_ROOT="/scratch/weiliu87/student/zss/r${JOB_NUM}"
+mkdir -p "$HF_HOME" "$HF_DATASETS_CACHE" "$XDG_CACHE_HOME" \
+  "$TRITON_CACHE_DIR" "$TMPDIR"
+
+echo "PBS job: $JOBID"
+echo "Compute host: $(hostname)"
+echo "Python: $(command -v python)"
+echo "Visible GPUs: ${CUDA_VISIBLE_DEVICES:-<unset>}"
+nvidia-smi -L
+
+# Match the Python and vLLM installation used by the failed 703885 job.
+python - <<'PY'
+import pathlib
+import sys
+import sysconfig
+
+cuda_file = pathlib.Path(sysconfig.get_paths()["purelib"]) / "vllm/platforms/cuda.py"
+print("Python version:", sys.version)
+print("vLLM CUDA source:", cuda_file)
+if sys.version_info[:2] != (3, 10) or not cuda_file.is_file():
+    raise SystemExit("Wrong container/Python environment for RLCR vLLM")
+PY
+
+# Jobs with different weights share this venv; patch the affected vLLM once.
+(
+  flock -x 8
+  python "$ROOT/DCPO/scripts/fix_vllm_uuid.py"
+) 8>"$WORKDIR/.venv-hopper-rlcr/.vllm_uuid_patch.lock"
+
+python - <<'PY'
+import os
+import torch
+from vllm.platforms.cuda import device_id_to_physical_device_id
+
+visible = os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",")
+if len(visible) != 4 or torch.cuda.device_count() != 4:
+    raise SystemExit(f"Expected four PBS GPUs, got {visible!r}")
+physical = [device_id_to_physical_device_id(i) for i in range(4)]
+if len(set(physical)) != 4:
+    raise SystemExit(f"GPU mapping is not one-to-one: {physical!r}")
+print("UUID to physical index:", list(zip(visible, physical)))
+PY
+
+python - "$WORKDIR" <<'PY'
+import pathlib
+import sys
+from types import SimpleNamespace
+from datasets import load_dataset
+from transformers import AutoConfig, AutoTokenizer
+import yaml
+
+root = pathlib.Path(sys.argv[1])
+model = root / "models/Qwen2.5-7B"
+dataset = root / "local_datasets/hotpot_qa"
+if not (model / "config.json").is_file():
+    raise SystemExit(f"Missing model config: {model}")
+if not dataset.is_dir():
+    raise SystemExit(f"Missing local dataset: {dataset}")
+AutoConfig.from_pretrained(str(model), local_files_only=True)
+AutoTokenizer.from_pretrained(str(model), local_files_only=True)
+data = load_dataset(str(dataset))
+for split in ("train", "test"):
+    if split not in data:
+        raise SystemExit(f"Hotpot split is missing: {split}")
+    columns = set(data[split].column_names)
+    if not {"answer", "source"} <= columns or not ({"question", "problem"} & columns):
+        raise SystemExit(f"Hotpot {split} columns are incompatible: {sorted(columns)}")
+print("Hotpot splits:", {key: len(value) for key, value in data.items()})
+sys.path.insert(0, str(root / "official_upstream"))
+from dataset_processing import process_dataset
+template = yaml.safe_load(
+    (root / "official_upstream/configs/Qwen-7B/hotpot/RLCR.yaml").read_text(encoding="utf-8")
+)
+process_dataset(data, SimpleNamespace(
+    sys_prompt_name=template["sys_prompt_name"],
+    task_spec=template.get("task_spec", "gen"),
+))
+print("Official Hotpot dataset mapping cached")
+PY
+
+if [[ "$PREFLIGHT_ONLY" == 1 ]]; then
+  echo "RLCR_HOPPER_PREFLIGHT_PASSED"
+  exit 0
+fi
+
+if [[ "$MAX_STEPS" == 1 ]]; then
+  OUT="$WORKDIR/data/hopper_weight_probe/lambda-$LAMBDA/job-$JOB_NUM"
+else
+  OUT="$WORKDIR/data/hopper_weight_train/lambda-$LAMBDA"
+fi
+mkdir -p "$OUT"
+exec 9>"$OUT/.run.lock"
+flock -n 9 || { echo "Another run is using $OUT" >&2; exit 2; }
+if [[ -f "$OUT/RUN_COMPLETE" ]]; then
+  echo "Run already completed: $OUT" >&2
+  exit 2
+fi
+
+CONFIG="$CACHE_ROOT/run-config.yaml"
+python - "$WORKDIR/official_upstream/configs/Qwen-7B/hotpot/RLCR.yaml" "$CONFIG" \
+  "$OUT" "$WORKDIR" "$LAMBDA" "$MAX_STEPS" <<'PY'
+import pathlib
+import sys
+import yaml
+
+template, destination, output_dir, workdir, label, max_steps = sys.argv[1:]
+config = yaml.safe_load(pathlib.Path(template).read_text(encoding="utf-8"))
+assert config["reward_funcs"] == [
+    "format", "accuracy", "brier", "mean_confidence", "confidence_one_or_zero"
+]
+assert config["reward_weights"] == [0.5, 0.5, 0.5, 1e-6, 1e-6]
+assert not config.get("conflict_diagnostic", False)
+accuracy = float(label)
+config["reward_weights"][1:3] = [accuracy, 1.0 - accuracy]
+config["model_name_or_path"] = f"{workdir}/models/Qwen2.5-7B"
+config["dataset_name"] = f"{workdir}/local_datasets/hotpot_qa"
+config["output_dir"] = output_dir
+config["run_name"] = f"RLCR-hotpot-lambda-{label}"
+config["push_to_hub"] = False
+config["report_to"] = []
+assert config["save_strategy"] == "steps"
+assert config["save_steps"] == 60
+assert config["save_total_limit"] == 1
+if int(max_steps) == 1:
+    config["max_steps"] = 1
+    config["save_strategy"] = "no"
+pathlib.Path(destination).write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
+print("Training config:", destination)
+print("Reward weights:", config["reward_weights"])
+print("Output:", output_dir)
+PY
+
+if [[ -f "$OUT/run-config.yaml" ]]; then
+  cmp -s "$CONFIG" "$OUT/run-config.yaml" || {
+    echo "Existing run has a different configuration: $OUT" >&2
+    exit 2
+  }
+else
+  cp "$CONFIG" "$OUT/run-config.yaml"
+fi
+
+# trainer_state.json is written after the optimizer, scheduler and RNG state.
+# A killed save may leave a newer checkpoint directory without that marker.
+RESUME="$(python - "$OUT" <<'PY'
+from pathlib import Path
+import sys
+
+out = Path(sys.argv[1])
+checkpoints = sorted(
+    (p for p in out.glob("checkpoint-*") if p.is_dir() and p.name[11:].isdigit()),
+    key=lambda p: int(p.name[11:]),
+    reverse=True,
+)
+complete = [p for p in checkpoints if (p / "trainer_state.json").is_file()]
+if checkpoints and not complete:
+    raise SystemExit("Checkpoint directories exist, but none has trainer_state.json")
+if complete:
+    print(complete[0])
+    if complete[0] != checkpoints[0]:
+        print(f"Skipping incomplete checkpoint: {checkpoints[0]}", file=sys.stderr)
+PY
+)"
+RESUME_ARGS=()
+if [[ -n "$RESUME" ]]; then
+  echo "Resuming from: $RESUME"
+  RESUME_ARGS=(--resume_from_checkpoint "$RESUME")
+fi
+
+time -p accelerate launch \
+  --num_processes 4 \
+  --config_file "$WORKDIR/local_configs/hopper-four-gpu-full-step.yaml" \
+  hopper_official_runner.py --config "$CONFIG" "${RESUME_ARGS[@]}"
+
+python - "$OUT" "$MAX_STEPS" <<'PY'
+import json
+import pathlib
+import sys
+
+out = pathlib.Path(sys.argv[1])
+max_steps = int(sys.argv[2])
+state_file = out / "trainer_state.json"
+if not state_file.is_file():
+    raise SystemExit(f"Missing trainer state: {state_file}")
+steps = json.loads(state_file.read_text(encoding="utf-8")).get("global_step")
+if not isinstance(steps, int) or steps < 1:
+    raise SystemExit(f"No optimizer step completed: {steps!r}")
+if max_steps == -1:
+    checkpoint_step = (steps // 60) * 60
+    checkpoint = out / f"checkpoint-{checkpoint_step}"
+    checkpoint_state = checkpoint / "trainer_state.json"
+    if checkpoint_step < 60 or not checkpoint_state.is_file():
+        raise SystemExit(f"Missing latest resumable checkpoint state: {checkpoint_state}")
+    optimizer_parts = list(checkpoint.rglob("*optim_states.pt"))
+    if len(optimizer_parts) < 4 or any(p.stat().st_size == 0 for p in optimizer_parts):
+        raise SystemExit(f"Missing four nonempty DeepSpeed optimizer shards: {optimizer_parts}")
+if not (out / "config.json").is_file():
+    raise SystemExit("Missing saved model config.json")
+index_file = out / "model.safetensors.index.json"
+if index_file.is_file():
+    index = json.loads(index_file.read_text(encoding="utf-8"))
+    weights = set(index["weight_map"].values())
+else:
+    weights = {"model.safetensors"}
+missing = [name for name in weights if not (out / name).is_file()
+           or (out / name).stat().st_size == 0]
+if missing:
+    raise SystemExit(f"Missing or empty model weights: {missing}")
+print("RLCR_HOPPER_WEIGHT_TRAIN_PASSED", "global_step=", steps)
+PY
+touch "$OUT/RUN_COMPLETE"
+IN_CONTAINER

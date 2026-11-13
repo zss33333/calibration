@@ -6,6 +6,7 @@ training loss or write to parameter .grad buffers.
 
 import json
 import math
+import os
 from pathlib import Path
 
 import torch
@@ -41,6 +42,11 @@ class OnlineConflictTrainer(CustomTrainer):
             raise ValueError("Online diagnosis requires one generation per update.")
         if self.args.gradient_accumulation_steps <= 0:
             raise ValueError("gradient_accumulation_steps must be positive.")
+        self._diag_accum_device = os.environ.get("RLCR_DIAG_ACCUM_DEVICE", "cpu").lower()
+        if self._diag_accum_device not in {"cpu", "cuda", "hybrid"}:
+            raise ValueError("RLCR_DIAG_ACCUM_DEVICE must be cpu, cuda, or hybrid.")
+        if os.environ.get("RLCR_DIAG_ENGINE", "legacy") != "reuse":
+            print(f"RLCR diagnostic accumulation device: {self._diag_accum_device}", flush=True)
         self._diag_count = 0
         self._diag_tokens = 0
         self._diag_no_brier = None
@@ -79,7 +85,10 @@ class OnlineConflictTrainer(CustomTrainer):
             )
             for i, grad in enumerate(grad_no_brier):
                 if grad is not None:
-                    value = grad.detach().to(device="cpu", dtype=torch.float32)
+                    value = grad.detach().to(
+                        device="cpu" if self._diag_accum_device == "hybrid" else self._diag_accum_device,
+                        dtype=torch.float32,
+                    )
                     if self._diag_no_brier[i] is None:
                         self._diag_no_brier[i] = value
                     else:
@@ -91,7 +100,10 @@ class OnlineConflictTrainer(CustomTrainer):
             )
             for i, grad in enumerate(grad_full):
                 if grad is not None:
-                    value = grad.detach().to(device="cpu", dtype=torch.float32)
+                    value = grad.detach().to(
+                        device=self.accelerator.device if self._diag_accum_device == "hybrid" else self._diag_accum_device,
+                        dtype=torch.float32,
+                    )
                     if self._diag_full[i] is None:
                         self._diag_full[i] = value
                     else:
@@ -116,20 +128,20 @@ class OnlineConflictTrainer(CustomTrainer):
         device = self.accelerator.device
         dot = no_brier_norm_sq = full_norm_sq = 0.0
         for i, parameter in enumerate(parameters):
-            no_brier_cpu = self._diag_no_brier[i]
-            full_cpu = self._diag_full[i]
+            no_brier_accum = self._diag_no_brier[i]
+            full_accum = self._diag_full[i]
             size = parameter.numel()
             for start in range(0, size, self._reduction_chunk_elements):
                 stop = min(start + self._reduction_chunk_elements, size)
                 length = stop - start
                 no_brier = (
-                    no_brier_cpu.reshape(-1)[start:stop].to(device)
-                    if no_brier_cpu is not None
+                    no_brier_accum.reshape(-1)[start:stop].to(device)
+                    if no_brier_accum is not None
                     else torch.zeros(length, device=device, dtype=torch.float32)
                 )
                 full = (
-                    full_cpu.reshape(-1)[start:stop].to(device)
-                    if full_cpu is not None
+                    full_accum.reshape(-1)[start:stop].to(device)
+                    if full_accum is not None
                     else torch.zeros(length, device=device, dtype=torch.float32)
                 )
                 if dist.is_initialized() and dist.get_world_size() > 1:
@@ -157,6 +169,9 @@ class OnlineConflictTrainer(CustomTrainer):
             "group_size": self.num_generations,
             "seed": self.args.seed,
             "model_name_or_path": self.model_name_or_path,
+            "diagnostic_accum_device": self._diag_accum_device,
+            "cuda_peak_allocated_gib": torch.cuda.max_memory_allocated(device) / 2**30,
+            "cuda_peak_reserved_gib": torch.cuda.max_memory_reserved(device) / 2**30,
             "reward_scope": "weighted_without_brier_vs_weighted_full",
             "projection_scope": "global_update_preclip",
             "brier_weight": brier_weight,

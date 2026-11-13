@@ -7,6 +7,7 @@ from trl import TrlParser
 import rl_runner
 from arguments import GRPOScriptArguments, GRPOConfig, ModelConfig
 from online_conflict_trainer import OnlineConflictTrainer
+from reused_gradient_trainer import ReusedGradientTrainer
 
 
 def main():
@@ -24,7 +25,14 @@ def main():
         f"{training_args.vllm_gpu_memory_utilization}",
         flush=True,
     )
-    rl_runner.CustomTrainer = OnlineConflictTrainer
+    engine = os.environ.get("RLCR_DIAG_ENGINE", "legacy")
+    if engine not in {"legacy", "reuse"}:
+        raise ValueError("RLCR_DIAG_ENGINE must be legacy or reuse.")
+    if engine == "reuse" and not (
+        training_args.bf16 and not training_args.fp16 and model_args.torch_dtype == "bfloat16"
+    ):
+        raise ValueError("Reused-gradient probe requires BF16 model and BF16 training.")
+    rl_runner.CustomTrainer = ReusedGradientTrainer if engine == "reuse" else OnlineConflictTrainer
     rl_runner.main(script_args, training_args, model_args)
 
 

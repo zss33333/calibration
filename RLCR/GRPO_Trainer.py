@@ -785,8 +785,8 @@ class CustomTrainer(Trainer):
 
     
 
-    def compute_conflict_losses(self, model, inputs):
-        """Build paired BNPO losses without changing the training loss."""
+    def compute_conflict_losses(self, model, inputs, include_full=True):
+        """Build diagnostic BNPO losses without changing the training loss."""
         required = ("diagnostic_adv_no_brier", "advantages")
         if any(key not in inputs for key in required):
             raise ValueError("Paired diagnostic tensors are missing.")
@@ -842,7 +842,7 @@ class CustomTrainer(Trainer):
             return (per_token_loss * completion_mask).sum() / denominator
 
         loss_no_brier = bnpo_loss(inputs["diagnostic_adv_no_brier"])
-        loss_full = bnpo_loss(inputs["advantages"])
+        loss_full = bnpo_loss(inputs["advantages"]) if include_full else None
 
         return loss_no_brier, loss_full, completion_mask.sum()
 

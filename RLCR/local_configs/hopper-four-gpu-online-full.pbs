@@ -1,0 +1,258 @@
+#!/bin/bash
+#PBS -P CFP03-SF-101
+#PBS -q autox
+#PBS -j oe
+#PBS -k oed
+#PBS -N rlcr4online
+#PBS -l walltime=24:00:00
+#PBS -l select=1:ngpus=4
+
+set -euo pipefail
+
+ROOT=/scratch/weiliu87/student/zss/calibration
+WORKDIR="$ROOT/RLCR"
+LAMBDA="${RLCR_LAMBDA:-0.50}"
+MAX_STEPS="${RLCR_MAX_STEPS:--1}"
+ACCUM_DEVICE="${RLCR_DIAG_ACCUM_DEVICE:-hybrid}"
+DIAG_ENGINE="${RLCR_DIAG_ENGINE:-legacy}"
+case "$LAMBDA" in
+  0.00|0.25|0.50|0.75|1.00) ;;
+  *) echo "RLCR_LAMBDA must be 0.00, 0.25, 0.50, 0.75, or 1.00" >&2; exit 2 ;;
+esac
+case "$MAX_STEPS" in
+  -1|1|2) ;;
+  *) echo "RLCR_MAX_STEPS must be -1 (full epoch), 1, or 2 (diagnostic probe)" >&2; exit 2 ;;
+esac
+case "$ACCUM_DEVICE" in
+  cpu|cuda|hybrid) ;;
+  *) echo "RLCR_DIAG_ACCUM_DEVICE must be cpu, cuda, or hybrid" >&2; exit 2 ;;
+esac
+case "$DIAG_ENGINE" in
+  legacy|reuse) ;;
+  *) echo "RLCR_DIAG_ENGINE must be legacy or reuse" >&2; exit 2 ;;
+esac
+if [[ "$DIAG_ENGINE" == reuse && "$MAX_STEPS" == -1 ]]; then
+  echo "The reused-gradient engine is probe-only until it matches a separate legacy probe" >&2
+  exit 2
+fi
+# Use the same image as the failed RLCR training job if it differs from this one.
+IMAGE=/app1/common/singularity-img/hopper/pytorch/pytorch_2.3.0_cuda_12.4_ngc_24.04.sif
+export APPTAINERENV_RLCR_DIAG_ACCUM_DEVICE="$ACCUM_DEVICE"
+export APPTAINERENV_RLCR_DIAG_ENGINE="$DIAG_ENGINE"
+test -r "$IMAGE"
+test -x "$WORKDIR/.venv-hopper-rlcr/bin/python"
+test -f "$WORKDIR/local_configs/hopper-four-gpu-full-step.yaml"
+test -f "$ROOT/DCPO/scripts/fix_vllm_uuid.py"
+module load singularity
+
+singularity exec --nv -B /scratch:/scratch "$IMAGE" \
+  bash -s -- "$ROOT" "$PBS_JOBID" "$LAMBDA" "$MAX_STEPS" "$ACCUM_DEVICE" <<'IN_CONTAINER'
+set -euo pipefail
+ROOT="$1"
+JOBID="$2"
+LAMBDA="$3"
+MAX_STEPS="$4"
+ACCUM_DEVICE="$5"
+WORKDIR="$ROOT/RLCR"
+cd "$WORKDIR"
+source "$WORKDIR/.venv-hopper-rlcr/bin/activate"
+export PYTHONUNBUFFERED=1
+export TOKENIZERS_PARALLELISM=false
+command -v flock >/dev/null || { echo "flock is required for concurrent lambda jobs" >&2; exit 2; }
+
+JOB_NUM="${JOBID%%.*}"
+CACHE_ROOT="/scratch/weiliu87/student/zss/cache/rlcr_online_full/$JOBID"
+export HF_HOME="$CACHE_ROOT/huggingface"
+export HF_DATASETS_CACHE="$CACHE_ROOT/hf_datasets"
+export XDG_CACHE_HOME="$CACHE_ROOT/xdg"
+export TRITON_CACHE_DIR="$CACHE_ROOT/triton"
+export TMPDIR="/scratch/weiliu87/student/zss/t_rlcr_$JOB_NUM"
+mkdir -p "$HF_HOME" "$HF_DATASETS_CACHE" "$XDG_CACHE_HOME" \
+  "$TRITON_CACHE_DIR" "$TMPDIR"
+
+echo "PBS job: $JOBID"
+echo "Compute host: $(hostname)"
+echo "Python: $(command -v python)"
+echo "Diagnostic engine: ${RLCR_DIAG_ENGINE:-legacy}"
+if [[ "${RLCR_DIAG_ENGINE:-legacy}" == legacy ]]; then
+  echo "Diagnostic accumulation device: $ACCUM_DEVICE"
+else
+  echo "Diagnostic auxiliary accumulation dtype: bfloat16 (sharded)"
+fi
+echo "Visible GPUs: ${CUDA_VISIBLE_DEVICES:-<unset>}"
+nvidia-smi -L
+
+# The login node is Python 3.9; the training container must resolve this venv
+# to Python 3.10 and to the vLLM installation seen in the failure traceback.
+python - <<'PY'
+import pathlib
+import sys
+import sysconfig
+
+cuda_file = pathlib.Path(sysconfig.get_paths()["purelib"]) / "vllm/platforms/cuda.py"
+print("Python version:", sys.version)
+print("vLLM CUDA source:", cuda_file)
+if sys.version_info[:2] != (3, 10) or not cuda_file.is_file():
+    raise SystemExit("Wrong container/Python environment for RLCR vLLM")
+PY
+
+# Several lambda jobs may start together and share this virtual environment.
+# Serialize the one-time source patch before accelerate creates its ranks.
+(
+  flock -x 8
+  python "$ROOT/DCPO/scripts/fix_vllm_uuid.py"
+) 8>"$WORKDIR/.venv-hopper-rlcr/.vllm_uuid_patch.lock"
+python - <<'PY'
+import os
+import torch
+from vllm.platforms.cuda import device_id_to_physical_device_id
+
+visible = os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",")
+if len(visible) != 4 or torch.cuda.device_count() != 4:
+    raise SystemExit(f"Expected four allocated GPUs, got {visible!r}")
+physical = [device_id_to_physical_device_id(i) for i in range(4)]
+if len(set(physical)) != 4:
+    raise SystemExit(f"Ranks do not resolve to four distinct GPUs: {physical!r}")
+print("UUID to physical index:", list(zip(visible, physical)))
+PY
+
+test -f "$WORKDIR/models/Qwen2.5-7B/config.json"
+test -d "$WORKDIR/local_datasets/hotpot_qa"
+if [[ "$MAX_STEPS" != -1 ]]; then
+  OUT="$WORKDIR/data/hopper_online_probe/lambda-$LAMBDA/job-$JOB_NUM"
+else
+  if [[ "$ACCUM_DEVICE" == cuda ]]; then
+    OUT="$WORKDIR/data/hopper_online_full_gpu/lambda-$LAMBDA"
+  elif [[ "$ACCUM_DEVICE" == hybrid ]]; then
+    OUT="$WORKDIR/data/hopper_online_full_hybrid/lambda-$LAMBDA"
+  else
+    OUT="$WORKDIR/data/hopper_online_full/lambda-$LAMBDA"
+  fi
+fi
+CONFIG="$CACHE_ROOT/run-config.yaml"
+mkdir -p "$OUT"
+exec 9>"$OUT/.run.lock"
+flock -n 9 || { echo "Another job is already running lambda=$LAMBDA" >&2; exit 2; }
+python - "$WORKDIR/configs/Qwen-7B/hotpot/RLCR.yaml" "$CONFIG" \
+  "$OUT" "$WORKDIR" "$LAMBDA" "$MAX_STEPS" <<'PY'
+import pathlib
+import sys
+import yaml
+
+template, destination, output_dir, workdir, label, max_steps = sys.argv[1:]
+config = yaml.safe_load(pathlib.Path(template).read_text(encoding="utf-8"))
+assert config["reward_funcs"] == [
+    "format", "accuracy", "brier", "mean_confidence", "confidence_one_or_zero"
+]
+accuracy = float(label)
+config["reward_weights"] = [0.5, accuracy, 1.0 - accuracy, 1e-6, 1e-6]
+config["model_name_or_path"] = f"{workdir}/models/Qwen2.5-7B"
+config["dataset_name"] = f"{workdir}/local_datasets/hotpot_qa"
+config["num_processes"] = 4
+config["output_dir"] = output_dir
+config["run_name"] = f"RLCR-hotpot-online-lambda-{label}"
+config["max_steps"] = int(max_steps)
+config["num_train_epochs"] = 1
+config["eval_strategy"] = "steps"
+config["eval_steps"] = 50
+config["save_strategy"] = "steps"
+config["save_steps"] = 60
+config["save_total_limit"] = 1
+if int(max_steps) != -1:
+    config["save_strategy"] = "no"
+config["push_to_hub"] = False
+config["report_to"] = []
+config["logging_steps"] = 1
+pathlib.Path(destination).write_text(
+    yaml.safe_dump(config, sort_keys=False), encoding="utf-8"
+)
+print("lambda:", label, "reward_weights:", config["reward_weights"])
+print("output:", output_dir, "max_steps:", config["max_steps"])
+print("eval_steps:", config["eval_steps"], "save_steps:", config["save_steps"],
+      "save_total_limit:", config["save_total_limit"])
+PY
+if [[ -f "$OUT/RUN_COMPLETE" ]]; then
+  echo "This lambda run already completed: $OUT" >&2
+  exit 2
+fi
+if [[ -f "$OUT/run-config.yaml" ]]; then
+  cmp -s "$CONFIG" "$OUT/run-config.yaml" || {
+    echo "Existing run uses a different configuration: $OUT" >&2
+    exit 2
+  }
+else
+  cp "$CONFIG" "$OUT/run-config.yaml"
+fi
+if [[ -f "$OUT/conflict_gradients.jsonl" ]]; then
+  python - "$OUT/conflict_gradients.jsonl" <<'PY'
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+    if line.strip() and json.loads(line).get("reward_scope") != "weighted_without_brier_vs_weighted_full":
+        raise SystemExit(
+            f"Old diagnostic definition in {path} line {number}; use a new output directory"
+        )
+PY
+fi
+
+# One full Hotpot epoch, or a one-update probe, with a paired gradient
+# diagnosis per optimizer step.
+# The algorithmic batch, reward functions, prompt/completion limits and seed
+# come from the official RLCR YAML; only weights and operational I/O vary.
+if [[ "$MAX_STEPS" != -1 ]]; then
+  export RLCR_SKIP_FINAL_MODEL_SAVE=1
+else
+  unset RLCR_SKIP_FINAL_MODEL_SAVE
+fi
+time -p accelerate launch \
+  --num_processes 4 \
+  --config_file "$WORKDIR/local_configs/hopper-four-gpu-full-step.yaml" \
+  online_conflict_runner.py \
+  --config "$CONFIG"
+
+# The one-update probe keeps state and diagnostics; full runs save weights.
+python - "$OUT" "$MAX_STEPS" <<'PY'
+import json
+import pathlib
+import sys
+
+out = pathlib.Path(sys.argv[1])
+requested_steps = int(sys.argv[2])
+state_file = out / "trainer_state.json"
+if not state_file.is_file():
+    raise SystemExit(f"Missing trainer state: {state_file}")
+state = json.loads(state_file.read_text(encoding="utf-8"))
+steps = state.get("global_step")
+if not isinstance(steps, int) or steps < 1:
+    raise SystemExit(f"Expected at least one update, got {steps!r}")
+if requested_steps != -1 and steps != requested_steps:
+    raise SystemExit(f"Expected {requested_steps} diagnostic updates, got {steps!r}")
+weights = []
+if requested_steps == -1:
+    if not (out / "config.json").is_file():
+        raise SystemExit("Missing saved model config.json")
+    index_file = out / "model.safetensors.index.json"
+    if index_file.is_file():
+        index = json.loads(index_file.read_text(encoding="utf-8"))
+        weights = sorted(set(index["weight_map"].values()))
+    else:
+        weights = ["model.safetensors"]
+    missing = [name for name in weights if not (out / name).is_file()
+               or (out / name).stat().st_size == 0]
+    if missing:
+        raise SystemExit(f"Missing or empty weight files: {missing}")
+diagnostics = out / "conflict_gradients.jsonl"
+if not diagnostics.is_file():
+    raise SystemExit(f"Missing diagnostic log: {diagnostics}")
+logged = {int(json.loads(line)["global_step"]) for line in
+          diagnostics.read_text(encoding="utf-8").splitlines() if line.strip()}
+if logged != set(range(1, steps + 1)):
+    raise SystemExit(f"Missing diagnostic steps: {sorted(set(range(1, steps + 1)) - logged)}")
+print("RLCR_ONLINE_FULL_PASSED", f"global_step={steps}", "weight_files=", weights)
+PY
+python "$WORKDIR/summarize_conflict_gradients.py" "$OUT"
+touch "$OUT/RUN_COMPLETE"
+IN_CONTAINER

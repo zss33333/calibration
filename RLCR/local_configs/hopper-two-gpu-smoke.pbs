@@ -1,0 +1,141 @@
+#!/bin/bash
+#PBS -P CFP03-SF-101
+#PBS -q autox
+#PBS -j oe
+#PBS -k oed
+#PBS -N rlcr2smoke
+#PBS -l walltime=02:00:00
+#PBS -l select=1:ngpus=2
+
+set -euo pipefail
+
+ROOT=/scratch/weiliu87/student/zss/calibration
+WORKDIR="$ROOT/RLCR"
+# Use the same image as the failed RLCR training job if it differs from this one.
+IMAGE=/app1/common/singularity-img/hopper/pytorch/pytorch_2.3.0_cuda_12.4_ngc_24.04.sif
+test -r "$IMAGE"
+test -x "$WORKDIR/.venv-hopper-rlcr/bin/python"
+test -f "$WORKDIR/local_configs/hopper-two-gpu-smoke.yaml"
+test -f "$ROOT/DCPO/scripts/fix_vllm_uuid.py"
+module load singularity
+
+singularity exec --nv -B /scratch:/scratch "$IMAGE" \
+  bash -s -- "$ROOT" "$PBS_JOBID" <<'IN_CONTAINER'
+set -euo pipefail
+ROOT="$1"
+JOBID="$2"
+WORKDIR="$ROOT/RLCR"
+cd "$WORKDIR"
+source "$WORKDIR/.venv-hopper-rlcr/bin/activate"
+export PYTHONUNBUFFERED=1
+export TOKENIZERS_PARALLELISM=false
+
+JOB_NUM="${JOBID%%.*}"
+CACHE_ROOT="/scratch/weiliu87/student/zss/cache/rlcr_smoke2/$JOBID"
+export HF_HOME="$CACHE_ROOT/huggingface"
+export HF_DATASETS_CACHE="$CACHE_ROOT/hf_datasets"
+export XDG_CACHE_HOME="$CACHE_ROOT/xdg"
+export TRITON_CACHE_DIR="$CACHE_ROOT/triton"
+export TMPDIR="/scratch/weiliu87/student/zss/t_rlcr_$JOB_NUM"
+mkdir -p "$HF_HOME" "$HF_DATASETS_CACHE" "$XDG_CACHE_HOME" \
+  "$TRITON_CACHE_DIR" "$TMPDIR"
+
+echo "PBS job: $JOBID"
+echo "Compute host: $(hostname)"
+echo "Python: $(command -v python)"
+echo "Visible GPUs: ${CUDA_VISIBLE_DEVICES:-<unset>}"
+nvidia-smi -L
+
+# The login node is Python 3.9; the training container must resolve this venv
+# to Python 3.10 and to the vLLM installation seen in the failure traceback.
+python - <<'PY'
+import pathlib
+import sys
+import sysconfig
+
+cuda_file = pathlib.Path(sysconfig.get_paths()["purelib"]) / "vllm/platforms/cuda.py"
+print("Python version:", sys.version)
+print("vLLM CUDA source:", cuda_file)
+if sys.version_info[:2] != (3, 10) or not cuda_file.is_file():
+    raise SystemExit("Wrong container/Python environment for RLCR vLLM")
+PY
+
+# Run once before accelerate creates ranks; this backs up a matching old file.
+python "$ROOT/DCPO/scripts/fix_vllm_uuid.py"
+python - <<'PY'
+import os
+import torch
+from vllm.platforms.cuda import device_id_to_physical_device_id
+
+visible = os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",")
+if len(visible) != 2 or torch.cuda.device_count() != 2:
+    raise SystemExit(f"Expected two allocated GPUs, got {visible!r}")
+physical = [device_id_to_physical_device_id(i) for i in range(2)]
+if len(set(physical)) != 2:
+    raise SystemExit(f"Both ranks resolve to the same GPU: {physical!r}")
+print("UUID to physical index:", list(zip(visible, physical)))
+PY
+
+test -f "$WORKDIR/models/Qwen2.5-7B/config.json"
+test -d "$WORKDIR/local_datasets/hotpot_qa"
+OUT="$WORKDIR/data/hopper_two_gpu_smoke_$JOB_NUM"
+if [[ -e "$OUT" ]]; then
+  echo "Refusing to reuse output directory: $OUT" >&2
+  exit 2
+fi
+echo "Smoke output: $OUT"
+
+# One real optimizer step, with smaller rollout and sequence lengths. The
+# original reward functions, ZeRO-2, bf16, vLLM colocate and save path remain.
+accelerate launch \
+  --num_processes 2 \
+  --config_file "$WORKDIR/local_configs/hopper-two-gpu-smoke.yaml" \
+  rl_runner.py \
+  --config configs/Qwen-7B/hotpot/RLCR.yaml \
+  --model_name_or_path "$WORKDIR/models/Qwen2.5-7B" \
+  --dataset_name "$WORKDIR/local_datasets/hotpot_qa" \
+  --output_dir "$OUT" \
+  --run_name "rlcr-hopper-smoke-$JOB_NUM" \
+  --train_subset_size 128 \
+  --per_device_train_batch_size 4 \
+  --gradient_accumulation_steps 4 \
+  --num_generations 32 \
+  --max_prompt_length 1024 \
+  --max_completion_length 256 \
+  --max_steps 1 \
+  --eval_strategy no \
+  --save_strategy no \
+  --logging_steps 1 \
+  --log_completions false \
+  --push_to_hub false \
+  --report_to none
+
+# rl_runner.py calls save_state() and save_model() even with save_strategy=no.
+python - "$OUT" <<'PY'
+import json
+import pathlib
+import sys
+
+out = pathlib.Path(sys.argv[1])
+state_file = out / "trainer_state.json"
+if not state_file.is_file():
+    raise SystemExit(f"Missing trainer state: {state_file}")
+state = json.loads(state_file.read_text(encoding="utf-8"))
+if state.get("global_step") != 1:
+    raise SystemExit(f"Expected global_step=1, got {state.get('global_step')!r}")
+if not (out / "config.json").is_file():
+    raise SystemExit("Missing saved model config.json")
+
+index_file = out / "model.safetensors.index.json"
+if index_file.is_file():
+    index = json.loads(index_file.read_text(encoding="utf-8"))
+    weights = sorted(set(index["weight_map"].values()))
+else:
+    weights = ["model.safetensors"]
+missing = [name for name in weights if not (out / name).is_file()
+           or (out / name).stat().st_size == 0]
+if missing:
+    raise SystemExit(f"Missing or empty weight files: {missing}")
+print("RLCR_TWO_GPU_SMOKE_PASSED", "global_step=1", "weight_files=", weights)
+PY
+IN_CONTAINER

@@ -1,0 +1,138 @@
+#!/bin/bash
+#PBS -P CFP03-SF-101
+#PBS -q autox
+#PBS -j oe
+#PBS -k oed
+#PBS -N dcpo120eval
+#PBS -l walltime=24:00:00
+#PBS -l select=1:ngpus=1
+
+set -euo pipefail
+WORKDIR="/scratch/weiliu87/student/zss/calibration/DCPO"
+IMAGE="/app1/common/singularity-img/hopper/pytorch/pytorch_2.3.0_cuda_12.4_ngc_24.04.sif"
+test -r "$IMAGE"
+test -x "$WORKDIR/.venv-hopper/bin/python"
+module load singularity
+
+singularity exec --nv -B /scratch:/scratch "$IMAGE" \
+  bash -s -- "$WORKDIR" "$PBS_JOBID" <<'IN_CONTAINER'
+set -euo pipefail
+WORKDIR="$1"
+JOBID="$2"
+cd "$WORKDIR"
+source .venv-hopper/bin/activate
+export PYTHONPATH="$WORKDIR${PYTHONPATH:+:$PYTHONPATH}"
+export VLLM_USE_V1=0
+export PYTHONUNBUFFERED=1
+JOB_NUM="${JOBID%%.*}"
+CACHE_ROOT="/scratch/weiliu87/student/zss/cache/dcpo_math_eval/$JOB_NUM"
+export HF_HOME="$CACHE_ROOT/huggingface"
+export XDG_CACHE_HOME="$CACHE_ROOT/xdg"
+export TRITON_CACHE_DIR="$CACHE_ROOT/triton"
+export TMPDIR="/scratch/weiliu87/student/zss/e$JOB_NUM"
+mkdir -p "$HF_HOME" "$XDG_CACHE_HOME" "$TRITON_CACHE_DIR" "$TMPDIR"
+
+RUN_NAME="${DCPO_RUN_NAME:-Qwen3-8B_HOPPER_4GPU_FULL}"
+STEP="${DCPO_EVAL_STEP:-120}"
+PROMPT_FORMAT="${DCPO_PROMPT_FORMAT:-paper}"
+[[ "$STEP" =~ ^[1-9][0-9]*$ ]]
+[[ "$PROMPT_FORMAT" == paper || "$PROMPT_FORMAT" == trained ]]
+RUN_DIR="$WORKDIR/checkpoints/MATH/$RUN_NAME"
+ACTOR_DIR="$RUN_DIR/global_step_$STEP/actor"
+MERGED_DIR="$RUN_DIR/evaluation/step_$STEP/hf_model"
+MERGE_DONE="$MERGED_DIR/.merge_complete"
+RESULT_DIR="$RUN_DIR/evaluation/step_$STEP/math_table_$PROMPT_FORMAT"
+BASE_MODEL="$WORKDIR/models/Qwen3-8B"
+test -d "$ACTOR_DIR"
+test -f "$BASE_MODEL/config.json"
+test -f "$WORKDIR/scripts/eval_math_table.py"
+test -f "$WORKDIR/scripts/model_merger.py"
+python -c 'import pandas, requests, sklearn; from opencompass.evaluator import MATHVerifyEvaluator'
+CHECK_OUTPUT="$(python scripts/eval_math_table.py --data-root data --check-data-only)"
+printf '%s\n' "$CHECK_OUTPUT"
+grep -Fxq 'EVAL_DATA_CHECK_PASSED' <<< "$CHECK_OUTPUT" || {
+  echo 'Evaluation script did not run its data check; sync the current scripts/eval_math_table.py' >&2
+  exit 2
+}
+shopt -s nullglob
+SHARDS=("$ACTOR_DIR"/model_world_size_*_rank_*.pt)
+((${#SHARDS[@]} > 0)) || { echo "No actor model shards in $ACTOR_DIR" >&2; exit 1; }
+echo "Using $ACTOR_DIR (${#SHARDS[@]} model shards)"
+nvidia-smi -L
+
+if [[ ! -f "$MERGE_DONE" ]]; then
+  mkdir -p "$MERGED_DIR"
+  python scripts/model_merger.py \
+    --backend fsdp \
+    --hf_model_path "$BASE_MODEL" \
+    --local_dir "$ACTOR_DIR" \
+    --target_dir "$MERGED_DIR"
+  python - "$MERGED_DIR" <<'PY'
+import json
+import sys
+from pathlib import Path
+root = Path(sys.argv[1])
+assert (root / 'config.json').is_file()
+index = root / 'model.safetensors.index.json'
+if index.is_file():
+    names = set(json.loads(index.read_text())['weight_map'].values())
+else:
+    names = {'model.safetensors'}
+assert names and all((root / name).is_file() and (root / name).stat().st_size > 0
+                     for name in names), f'Incomplete merged model: {names}'
+print(f'Merged model has {len(names)} weight files', flush=True)
+PY
+  touch "$MERGE_DONE"
+fi
+test -f "$MERGE_DONE"
+
+python -m vllm.entrypoints.openai.api_server \
+  --model "$MERGED_DIR" \
+  --tokenizer "$BASE_MODEL" \
+  --served-model-name dcpo-step$STEP \
+  --tensor-parallel-size 1 \
+  --dtype bfloat16 \
+  --max-model-len 8192 \
+  --gpu-memory-utilization 0.85 \
+  --port 8000 > "$RUN_DIR/evaluation/step_$STEP/vllm.log" 2>&1 &
+SERVER_PID=$!
+trap 'kill "$SERVER_PID" 2>/dev/null || true; wait "$SERVER_PID" 2>/dev/null || true' EXIT
+
+python - <<'PY'
+import time
+import urllib.request
+url = 'http://127.0.0.1:8000/v1/models'
+for _ in range(120):
+    try:
+        with urllib.request.urlopen(url, timeout=2) as response:
+            if response.status == 200:
+                print('vLLM is ready', flush=True)
+                break
+    except Exception:
+        time.sleep(5)
+else:
+    raise SystemExit('vLLM did not become ready within 10 minutes; inspect vllm.log')
+PY
+
+python scripts/eval_math_table.py \
+  --data-root data \
+  --output-dir "$RESULT_DIR" \
+  --model "dcpo-step$STEP" \
+  --prompt-format "$PROMPT_FORMAT" \
+  --repeats 4 \
+  --bins 20 \
+  --invalid-policy author \
+  --workers 16
+test -s "$RESULT_DIR/per_run.csv"
+test -s "$RESULT_DIR/summary.csv"
+test -s "$RESULT_DIR/summary.json"
+for dataset in MATH-500 AIME24 AIME25 AMC23 AMC24; do
+  for repeat in 1 2 3 4; do
+    test -s "$RESULT_DIR/${dataset}_run${repeat}.jsonl" || {
+      echo "Missing result file: $RESULT_DIR/${dataset}_run${repeat}.jsonl" >&2
+      exit 2
+    }
+  done
+done
+echo "Results: $RESULT_DIR"
+IN_CONTAINER
