@@ -1,5 +1,7 @@
 # DCPO DeepScaleR training data audit
 
+All `data/` and `scripts/` paths below refer to the sibling `../DCPO` source project; the data files remain there.
+
 Audited the files published in [`icip-cas/DCPO/data`](https://github.com/icip-cas/DCPO/tree/master/data). This is a read-only audit; no training rows were changed or removed.
 
 ## Provenance and structure
